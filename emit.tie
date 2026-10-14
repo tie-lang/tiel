@@ -49,6 +49,7 @@ pub const T_E_APPEND: i64 = 29;    // target + value
 pub const T_E_ASSIGN: i64 = 30;    // op + target + value
 pub const T_E_DECON: i64 = 31;     // 目标区段(2) + src
 pub const T_E_UNWRAP: i64 = 32;    // e（xs... 展开）
+pub const T_E_TERNARY: i64 = 33;   // cond + then + else（条件取值 cond ? then : else）
 
 // ---------- tag 常量：语句 ----------
 pub const T_S_BLOCK: i64 = 40;     // 语句区段(2)
@@ -384,12 +385,34 @@ pub func em_err_code() -> string {
     return em_err_x
 }
 
+// ---------- 错误槽快照（供解析层探测回退；save/restore 配对） ----------
+pub func em_err_snap() -> (i64, i64, i64, i64, string, string) {
+    var he: i64 = 0
+    if em_has_err {
+        he = 1
+    }
+    return (he, em_err_l, em_err_c, em_err_k, em_err_m, em_err_x)
+}
+
+pub func em_err_unsnap(he: i64, el: i64, ec: i64, ek: i64, emsg: string, ecode: string) {
+    if he == 1 {
+        em_has_err = true
+    } else {
+        em_has_err = false
+    }
+    em_err_l = el
+    em_err_c = ec
+    em_err_k = ek
+    em_err_m = emsg
+    em_err_x = ecode
+}
+
 // ---------- 自检与统计 ----------
 func em_tag_ok(tg: i64) -> bool {
     if tg >= 1 && tg <= 8 {
         return true
     }
-    if tg >= 10 && tg <= 32 {
+    if tg >= 10 && tg <= 33 {
         return true
     }
     if tg >= 40 && tg <= 51 {

@@ -336,6 +336,29 @@ pub func lx_start(src: string) {
     lx_t_id = -1
 }
 
+// ---------- 位置快照（供解析层探测回退；save/restore 配对） ----------
+pub func lx_snap() -> (i64, i64, i64, i64, i64, i64, string) {
+    var ht: i64 = 0
+    if lx_has_tok {
+        ht = 1
+    }
+    return (lx_pos, lx_cur_line, lx_cur_col, lx_paren, lx_last_tag, ht, lx_unesc)
+}
+
+pub func lx_unsnap(pos: i64, line: i64, col: i64, paren: i64, last_tag: i64, has_tok: i64, unesc: string) {
+    lx_pos = pos
+    lx_cur_line = line
+    lx_cur_col = col
+    lx_paren = paren
+    lx_last_tag = last_tag
+    if has_tok == 1 {
+        lx_has_tok = true
+    } else {
+        lx_has_tok = false
+    }
+    lx_unesc = unesc
+}
+
 // ---------- 当前词元访问器 ----------
 pub func lx_kind() -> i64 {
     return lx_tag
