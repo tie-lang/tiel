@@ -3,7 +3,8 @@ type tie<class, unsafe:lock>
 // 文件级 lock 授权：tiel 会话单线程（嵌入面文档已注「非线程安全」）⇒ 表访问免锁。
 // ============================================================
 // 形态：游标 + 当前词元（拉取协议），不物化 token 表。
-//   lx_start(src) 开启会话（源文本由 emit 层保留）→ lx_next() 逐个前进。
+//   lx_start(src) / lx_start_at(src, off, line) 开启会话（源文本由 emit 层保留）
+//   → lx_next() 逐个前进。
 //   词元 = (kind, 行列, 源字节区段, 名 id)；行列自 1 起，列按码点计。
 // ASI（自动分号；对齐现管线实测行为）：
 //   换行处按「行尾词元」判定——为续行类时不断句，否则插入分号（分号位置
@@ -321,12 +322,18 @@ func lx_asi_after_nl() {
 
 // ---------- 会话开启 ----------
 pub func lx_start(src: string) {
+    lx_start_at(src, 0, 1)
+}
+
+// 从源内偏移 off 起跑（行号以 line 计）：供语法层跳过头部区后直接起跑
+// （与「保行剥离后整文词法」等价，但免整文拷贝）。
+pub func lx_start_at(src: string, off: i64, line: i64) {
     em_set_src(src)
     em_clear_err()
     lx_src = src
     lx_n = len(src)
-    lx_pos = 0
-    lx_cur_line = 1
+    lx_pos = off
+    lx_cur_line = line
     lx_cur_col = 1
     lx_paren = 0
     lx_last_tag = -1
@@ -453,12 +460,22 @@ func lx_scan_ident() -> i64 {
     var so = lx_pos
     var sl = lx_cur_line
     var sc = lx_cur_col
-    while lx_pos < lx_n {
-        if !lx_is_ident_cont(lx_byte(lx_pos)) {
+    // 就地扫描（免逐字节 lx_adv1 调用）：接受集与 lx_is_ident_cont 一致；
+    // 列按码点计（续字节 128..191 不计列）。
+    var p = lx_pos
+    var col = lx_cur_col
+    while p < lx_n {
+        var b = str_byte(lx_src, p)
+        if !(b >= 48 && b <= 57) && !(b >= 97 && b <= 122) && !(b >= 65 && b <= 90) && b != 95 && b <= 127 {
             break
         }
-        lx_adv1()
+        p = p + 1
+        if b < 128 || b >= 192 {
+            col = col + 1
+        }
     }
+    lx_pos = p
+    lx_cur_col = col
     var txt = str_sub_bytes(lx_src, so, lx_pos)
     var kw = lx_kw_find(txt)
     if kw >= 0 {
@@ -745,7 +762,11 @@ func lx_scan_str_body(kind: i64, raw: i64) -> i64 {
             lx_adv1()
             continue
         }
-        lx_adv1()
+        // 常规字符快进（免 lx_adv1 调用）
+        lx_pos = lx_pos + 1
+        if b < 128 || b >= 192 {
+            lx_cur_col = lx_cur_col + 1
+        }
     }
     return -3                                   // EOF（未闭合）
 }
@@ -777,7 +798,11 @@ func lx_scan_triple() -> i64 {
         if b == 10 {
             lx_adv_nl()
         } else {
-            lx_adv1()
+            // 常规字符快进（免 lx_adv1 调用）
+            lx_pos = lx_pos + 1
+            if b < 128 || b >= 192 {
+                lx_cur_col = lx_cur_col + 1
+            }
         }
     }
     return -1
@@ -1159,10 +1184,14 @@ func lx_scan_slash() -> i64 {
     var b1 = lx_peek(1)
     if b1 == 47 {                               // 行注释（含 ///）
         while lx_pos < lx_n {
-            if lx_byte(lx_pos) == 10 {
+            var cb = str_byte(lx_src, lx_pos)
+            if cb == 10 {
                 break
             }
-            lx_adv1()
+            lx_pos = lx_pos + 1
+            if cb < 128 || cb >= 192 {
+                lx_cur_col = lx_cur_col + 1
+            }
         }
         return 0
     }
@@ -1209,7 +1238,15 @@ pub func lx_next() -> bool {
             continue
         }
         if b == 32 || b == 9 || b == 13 {
-            lx_adv1()
+            // 空白段快进（免逐字节调用；三者皆 ASCII ⇒ 每字节计一列）
+            while lx_pos < lx_n {
+                var wb = str_byte(lx_src, lx_pos)
+                if wb != 32 && wb != 9 && wb != 13 {
+                    break
+                }
+                lx_pos = lx_pos + 1
+                lx_cur_col = lx_cur_col + 1
+            }
             continue
         }
         if b == 47 {                            // '/'

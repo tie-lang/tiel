@@ -3,7 +3,7 @@ type tie<class, unsafe:lock>
 // 文件级 lock 授权：tiel 会话单线程（嵌入面文档已注「非线程安全」）⇒ 表访问免锁。
 // ============================================================
 // 形态：两词元前瞻（定点环形队列，免搬移），递归下降，覆盖 tsc 规范全部构造。
-//   入口 ps_parse(src)：头部保行剥离 → lx_start → 顶层块（S_BLOCK）→ 返回根 id。
+//   入口 ps_parse(src)：头部区跳过（免拷贝）→ lx_start_at → 顶层块（S_BLOCK）→ 返回根 id。
 //
 // 两条核心纪律：
 //   1) 区段不交错——凡「列表」的落池必须在所有子项解析完成之后统一执行
@@ -29,8 +29,13 @@ const PS_B_REST: i64 = 1;       // A_BIND：剩余（...rest）
 // ---------- 词元前瞻队列（固定容量环形；出队只移指针，不搬元素） ----------
 // 容量须 > 最大前瞻深度（ps_kind 最大 k=2 ⇒ 在队 ≤ 3；新增 k≥3 的调用须同步扩容）。
 const PQ_CAP: i64 = 4;
-// 快照栈层宽：head + n + dead + gt_pend + ll + 6 列 × 4 槽 = 29
-const PS_SNAP_W: i64 = 29;
+// 打包位宽：A = tag<<48 | line<<24 | col（约束 tag<2^15 / line<2^24 / col<2^24）；
+//           B = len<<36 | off（约束 令牌长<2^26 / 源长<2^36）。
+// 打包把每词元的队列写入从 6 次表操作降到 3 次。
+const PQ_LC_M: i64 = 16777215;       // 2^24 - 1
+const PQ_OFF_M: i64 = 68719476735;   // 2^36 - 1
+// 快照栈层宽：head + n + dead + gt_pend + ll + 3 列 × 4 槽 = 17
+const PS_SNAP_W: i64 = 17;
 var ps_dead: bool = false;
 var ps_gt_pend: i64 = 0;        // 类型位 `>>` 拆分余量（嵌套泛型 `table<table<i64>>`）
 var ps_ll: i64 = 0;             // 最近消费词元的行号（语句结束检查的「新行」判据）
@@ -40,11 +45,8 @@ var pq_n: i64 = 0;              // 在队词元数（0..3）
 // 快照面 = 词法游标与行状态 + 词元队列（环形全 4 槽） + ps 标量 + 错误槽；栈式、可嵌套。
 // 每层 = PS_SNAP_W 个标量平铺（环形槽值直接存取，免逐元素内容重拷贝）。
 var ps_ss: table<i64> = [];
-var pq_tag: table<i64> = [0, 0, 0, 0];
-var pq_line: table<i64> = [0, 0, 0, 0];
-var pq_col: table<i64> = [0, 0, 0, 0];
-var pq_off: table<i64> = [0, 0, 0, 0];
-var pq_len: table<i64> = [0, 0, 0, 0];
+var pq_a: table<i64> = [0, 0, 0, 0];   // tag<<48 | line<<24 | col
+var pq_b: table<i64> = [0, 0, 0, 0];   // len<<36 | off
 var pq_id: table<i64> = [0, 0, 0, 0];
 
 // 逻辑位置 p（0 = 队首）→ 环形物理槽
@@ -52,13 +54,10 @@ func pq_slot(p: i64) -> i64 {
     return (pq_head + p) & 3
 }
 
-// 六列入队（写入给定物理槽；槽槽同步 + 计数）
+// 三列入队（写入给定物理槽；槽槽同步 + 计数）
 func pq_put(s: i64, tag: i64, line: i64, col: i64, off: i64, len2: i64, id: i64) {
-    pq_tag[s] = tag
-    pq_line[s] = line
-    pq_col[s] = col
-    pq_off[s] = off
-    pq_len[s] = len2
+    pq_a[s] = (tag << 48) | (line << 24) | col
+    pq_b[s] = (len2 << 36) | off
     pq_id[s] = id
     pq_n = pq_n + 1
 }
@@ -96,23 +95,24 @@ func ps_ensure(k: i64) {
 
 func ps_kind(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_tag[pq_slot(k)]
+    return pq_a[pq_slot(k)] >> 48
 }
 
 func ps_line(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_line[pq_slot(k)]
+    return (pq_a[pq_slot(k)] >> 24) & PQ_LC_M
 }
 
 func ps_col(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_col[pq_slot(k)]
+    return pq_a[pq_slot(k)] & PQ_LC_M
 }
 
 func ps_text(k: i64) -> string {
     ps_ensure(k)
-    var s = pq_slot(k)
-    return str_sub_bytes(em_src, pq_off[s], pq_off[s] + pq_len[s])
+    var b = pq_b[pq_slot(k)]
+    var o = b & PQ_OFF_M
+    return str_sub_bytes(em_src, o, o + (b >> 36))
 }
 
 func ps_qid(k: i64) -> i64 {
@@ -123,12 +123,12 @@ func ps_qid(k: i64) -> i64 {
 // 词元 k 的源文本是否等于字面量 lit（按字节比对源区段；免子串分配）
 func ps_span_eq(k: i64, lit: string) -> bool {
     ps_ensure(k)
-    var s = pq_slot(k)
-    if pq_len[s] != len(lit) {
+    var b = pq_b[pq_slot(k)]
+    if (b >> 36) != len(lit) {
         return false
     }
     var i: i64 = 0
-    var o = pq_off[s]
+    var o = b & PQ_OFF_M
     while i < len(lit) {
         if str_byte(em_src, o + i) != str_byte(lit, i) {
             return false
@@ -140,7 +140,7 @@ func ps_span_eq(k: i64, lit: string) -> bool {
 
 func ps_adv() {
     ps_ensure(0)
-    ps_ll = pq_line[pq_head]
+    ps_ll = (pq_a[pq_head] >> 24) & PQ_LC_M
     pq_head = (pq_head + 1) & 3
     pq_n = pq_n - 1
 }
@@ -162,11 +162,8 @@ func ps_save() {
     table_push(ps_ss, ps_ll)
     var s: i64 = 0
     while s < PQ_CAP {
-        table_push(ps_ss, pq_tag[s])
-        table_push(ps_ss, pq_line[s])
-        table_push(ps_ss, pq_col[s])
-        table_push(ps_ss, pq_off[s])
-        table_push(ps_ss, pq_len[s])
+        table_push(ps_ss, pq_a[s])
+        table_push(ps_ss, pq_b[s])
         table_push(ps_ss, pq_id[s])
         s = s + 1
     }
@@ -192,15 +189,9 @@ func ps_restore() {
     i = i + 1
     var s: i64 = 0
     while s < PQ_CAP {
-        pq_tag[s] = ps_ss[i]
+        pq_a[s] = ps_ss[i]
         i = i + 1
-        pq_line[s] = ps_ss[i]
-        i = i + 1
-        pq_col[s] = ps_ss[i]
-        i = i + 1
-        pq_off[s] = ps_ss[i]
-        i = i + 1
-        pq_len[s] = ps_ss[i]
+        pq_b[s] = ps_ss[i]
         i = i + 1
         pq_id[s] = ps_ss[i]
         i = i + 1
@@ -361,7 +352,7 @@ func ps_set_seg(node: i64, slot: i64, lst: table<i64>) {
     em_put(node, slot + 1, len(lst))
 }
 
-// ---------- 头部保行剥离（声明行 → 空行；行数守恒） ----------
+// ---------- 头部区跳过（声明行/空行不进词法；行号偏移承担「保行」） ----------
 func ps_line_prefix(src: string, a: i64, b: i64, pref: string) -> bool {
     var pl = len(pref)
     if b - a < pl {
@@ -377,41 +368,36 @@ func ps_line_prefix(src: string, a: i64, b: i64, pref: string) -> bool {
     return true
 }
 
-pub func ps_strip_header(src: string) -> string {
-    var sb = string_builder()
+// 头部区 = 文件最前的连续「空行 / type tie 声明行」。
+// 返回 头部行数<<40 | 头部区结束偏移：lexer 从偏移处、行号=行数+1 起跑。
+// 与旧「保行剥离（声明行→空行）后整文词法」逐字节等价（免整文拷贝）：
+//   剥离产物 = "\n"×(行数-1) [+ "\n"+正文] ⇒ 词法与「偏移起跑」在
+//   词元序列/行列上完全一致；纯头部文件（无正文）行数回退 1 与 EOF 位置对齐。
+const PS_HS_OFF_M: i64 = 1099511627775;   // 2^40 - 1
+pub func ps_header_skip(src: string) -> i64 {
     var n = len(src)
     var i: i64 = 0
-    var in_header = true
-    var cnt: i64 = 0
+    var lines: i64 = 0
     while i <= n {
         var j = i
         while j < n && str_byte(src, j) != 10 {
             j = j + 1
         }
-        var emit_blank = false
-        if in_header {
-            var t = i
-            while t < j && (str_byte(src, t) == 32 || str_byte(src, t) == 9) {
-                t = t + 1
-            }
-            if t == j {
-                emit_blank = true
-            } else if ps_line_prefix(src, t, j, "type tie") {
-                emit_blank = true
-            } else {
-                in_header = false
-            }
+        var t = i
+        while t < j && (str_byte(src, t) == 32 || str_byte(src, t) == 9) {
+            t = t + 1
         }
-        if cnt > 0 {
-            sb_append(sb, "\n")
+        if t != j && !ps_line_prefix(src, t, j, "type tie") {
+            // 首个正文行：头部区结束，偏移即其行首（不消费）
+            break
         }
-        cnt = cnt + 1
-        if !emit_blank {
-            sb_append(sb, str_sub_bytes(src, i, j))
-        }
+        lines = lines + 1
         i = j + 1
     }
-    return sb_build(sb)
+    if i > n {
+        i = n
+    }
+    return (lines << 40) | i
 }
 
 // ---------- 类型解析 ----------
@@ -828,12 +814,12 @@ func ps_primary() -> i64 {
 // 队列区段访问
 func ps_off_of(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_off[k]
+    return pq_b[pq_slot(k)] & PQ_OFF_M
 }
 
 func ps_len_of(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_len[k]
+    return pq_b[pq_slot(k)] >> 36
 }
 
 // 括号：分组 或 元组字面量
@@ -2501,8 +2487,13 @@ pub func ps_parse(src: string) -> i64 {
     ps_ll = 0
     table_trunc(ps_ss, 0)
     pq_clear()
-    var body = ps_strip_header(src)
-    lx_start(body)
+    var hs = ps_header_skip(src)
+    var hoff = hs & PS_HS_OFF_M
+    var hln = hs >> 40
+    if hoff >= len(src) && hln > 0 {
+        hln = hln - 1             // 纯头部文件：与保行剥离后的 EOF 位置一致
+    }
+    lx_start_at(src, hoff, hln + 1)
     var st: table<i64> = []
     while true {
         while ps_kind(0) == K_SEMI {
