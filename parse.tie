@@ -1245,98 +1245,74 @@ func ps_bin_new(op: i64, l: i64, r: i64) -> i64 {
     return n
 }
 
-func ps_e_mul() -> i64 {
+// 优先级表（大 = 结合紧；比较级走 ps_rel_seg 特殊形态，不在此表）
+func ps_op_prec(k: i64) -> i64 {
+    if k == K_STAR || k == K_SLASH || k == K_PERCENT || k == K_BACKSLASH || k == K_PERCENTPERCENT {
+        return 12
+    }
+    if k == K_PLUS || k == K_MINUS {
+        return 11
+    }
+    if k == K_SHL || k == K_SHR {
+        return 10
+    }
+    if k == K_EQEQ || k == K_NOTEQ {
+        return 8
+    }
+    if k == K_AMP {
+        return 7
+    }
+    if k == K_CARET {
+        return 6
+    }
+    if k == K_PIPE {
+        return 5
+    }
+    if k == K_ANDAND {
+        return 4
+    }
+    if k == K_OROR {
+        return 3
+    }
+    return 0
+}
+
+// 二元循环（Pratt；min_prec = 最低结合级；左结合族）。
+// 操作数 = 幂级；比较级（< > <= >= 链 / in / not in / is）转 ps_rel_seg 特殊形态。
+func ps_bin(min_prec: i64) -> i64 {
     var left = ps_e_power()
     if left < 0 {
         return -1
     }
     while true {
         var k = ps_kind(0)
-        if k == K_STAR || k == K_SLASH || k == K_PERCENT || k == K_BACKSLASH || k == K_PERCENTPERCENT {
-            ps_adv()
-            var r = ps_e_power()
-            if r < 0 {
-                return -1
+        if min_prec <= 9 {
+            if k == K_LT || k == K_GT || k == K_LE || k == K_GE || k == KW_IN || k == KW_IS ||
+                (k == K_IDENT && ps_span_eq(0, "not") && ps_kind(1) == KW_IN) {
+                left = ps_rel_seg(left)
+                if left < 0 {
+                    return -1
+                }
+                continue
             }
-            left = ps_bin_new(k, left, r)
-        } else {
+        }
+        var p = ps_op_prec(k)
+        if p == 0 || p < min_prec {
             break
         }
+        ps_adv()
+        var r = ps_bin(p + 1)
+        if r < 0 {
+            return -1
+        }
+        left = ps_bin_new(k, left, r)
     }
     return left
 }
 
-func ps_e_add() -> i64 {
-    var left = ps_e_mul()
-    if left < 0 {
-        return -1
-    }
-    while true {
-        var k = ps_kind(0)
-        if k == K_PLUS || k == K_MINUS {
-            ps_adv()
-            var r = ps_e_mul()
-            if r < 0 {
-                return -1
-            }
-            left = ps_bin_new(k, left, r)
-        } else {
-            break
-        }
-    }
-    return left
-}
-
-func ps_e_shift() -> i64 {
-    var left = ps_e_add()
-    if left < 0 {
-        return -1
-    }
-    while true {
-        var k = ps_kind(0)
-        if k == K_SHL || k == K_SHR {
-            ps_adv()
-            var r = ps_e_add()
-            if r < 0 {
-                return -1
-            }
-            left = ps_bin_new(k, left, r)
-        } else {
-            break
-        }
-    }
-    return left
-}
-
-// 比较链折叠：< > <= >= 多段以 && 连接；单段保持二元
-func ps_fold_cmp(items: table<i64>, ops: table<i64>) -> i64 {
-    var m = len(ops)
-    if m == 0 {
-        return items[0]
-    }
-    if m == 1 {
-        return ps_bin_new(ops[0], items[0], items[1])
-    }
-    var segs: table<i64> = []
-    var i: i64 = 0
-    while i < m {
-        table_push(segs, ps_bin_new(ops[i], items[i], items[i + 1]))
-        i = i + 1
-    }
-    var acc = segs[0]
-    i = 1
-    while i < len(segs) {
-        acc = ps_bin_new(K_ANDAND, acc, segs[i])
-        i = i + 1
-    }
-    return acc
-}
-
-func ps_e_rel() -> i64 {
-    var left = ps_e_shift()
-    if left < 0 {
-        return -1
-    }
+// 比较段（< > <= >= 链折叠 + in / not in / is 特殊形态）；操作数 = 移位级（ps_bin(10)）。
+// 比较链以 && 连接在 ps_fold_cmp。
+func ps_rel_seg(left: i64) -> i64 {
     var items: table<i64> = []
     var ops: table<i64> = []
     table_push(items, left)
@@ -1345,7 +1321,7 @@ func ps_e_rel() -> i64 {
         if k == K_LT || k == K_GT || k == K_LE || k == K_GE {
             table_push(ops, k)
             ps_adv()
-            var r = ps_e_shift()
+            var r = ps_bin(10)
             if r < 0 {
                 return -1
             }
@@ -1357,7 +1333,7 @@ func ps_e_rel() -> i64 {
             ops = []
             table_push(items, left)
             ps_adv()
-            var r2 = ps_e_shift()
+            var r2 = ps_bin(10)
             if r2 < 0 {
                 return -1
             }
@@ -1365,13 +1341,13 @@ func ps_e_rel() -> i64 {
             items = []
             ops = []
             table_push(items, left)
-        } else if k == K_IDENT && ps_text(0) == "not" && ps_kind(1) == KW_IN {
+        } else if k == K_IDENT && ps_span_eq(0, "not") && ps_kind(1) == KW_IN {
             left = ps_fold_cmp(items, ops)
             items = []
             ops = []
             ps_adv()
             ps_adv()
-            var r3 = ps_e_shift()
+            var r3 = ps_bin(10)
             if r3 < 0 {
                 return -1
             }
@@ -1398,111 +1374,35 @@ func ps_e_rel() -> i64 {
     return ps_fold_cmp(items, ops)
 }
 
-func ps_e_eq() -> i64 {
-    var left = ps_e_rel()
-    if left < 0 {
-        return -1
+// 比较链折叠：< > <= >= 多段以 && 连接；单段保持二元
+func ps_fold_cmp(items: table<i64>, ops: table<i64>) -> i64 {
+    var m = len(ops)
+    if m == 0 {
+        return items[0]
     }
-    while true {
-        var k = ps_kind(0)
-        if k == K_EQEQ || k == K_NOTEQ {
-            ps_adv()
-            var r = ps_e_rel()
-            if r < 0 {
-                return -1
-            }
-            left = ps_bin_new(k, left, r)
-        } else {
-            break
-        }
+    if m == 1 {
+        return ps_bin_new(ops[0], items[0], items[1])
     }
-    return left
+    var segs: table<i64> = []
+    var i: i64 = 0
+    while i < m {
+        table_push(segs, ps_bin_new(ops[i], items[i], items[i + 1]))
+        i = i + 1
+    }
+    var acc = segs[0]
+    i = 1
+    while i < len(segs) {
+        acc = ps_bin_new(K_ANDAND, acc, segs[i])
+        i = i + 1
+    }
+    return acc
 }
 
-func ps_e_bitand() -> i64 {
-    var left = ps_e_eq()
-    if left < 0 {
-        return -1
-    }
-    while ps_kind(0) == K_AMP {
-        ps_adv()
-        var r = ps_e_eq()
-        if r < 0 {
-            return -1
-        }
-        left = ps_bin_new(K_AMP, left, r)
-    }
-    return left
-}
-
-func ps_e_bitxor() -> i64 {
-    var left = ps_e_bitand()
-    if left < 0 {
-        return -1
-    }
-    while ps_kind(0) == K_CARET {
-        ps_adv()
-        var r = ps_e_bitand()
-        if r < 0 {
-            return -1
-        }
-        left = ps_bin_new(K_CARET, left, r)
-    }
-    return left
-}
-
-func ps_e_bitor() -> i64 {
-    var left = ps_e_bitxor()
-    if left < 0 {
-        return -1
-    }
-    while ps_kind(0) == K_PIPE {
-        ps_adv()
-        var r = ps_e_bitxor()
-        if r < 0 {
-            return -1
-        }
-        left = ps_bin_new(K_PIPE, left, r)
-    }
-    return left
-}
-
-func ps_e_and() -> i64 {
-    var left = ps_e_bitor()
-    if left < 0 {
-        return -1
-    }
-    while ps_kind(0) == K_ANDAND {
-        ps_adv()
-        var r = ps_e_bitor()
-        if r < 0 {
-            return -1
-        }
-        left = ps_bin_new(K_ANDAND, left, r)
-    }
-    return left
-}
-
-func ps_e_or() -> i64 {
-    var left = ps_e_and()
-    if left < 0 {
-        return -1
-    }
-    while ps_kind(0) == K_OROR {
-        ps_adv()
-        var r = ps_e_and()
-        if r < 0 {
-            return -1
-        }
-        left = ps_bin_new(K_OROR, left, r)
-    }
-    return left
-}
 
 // 条件取值 cond ? then : else（右结合；`?` 的消歧探测在 ps_e_postfix——
 // 探测判定为三目时还原词法不消费，回到本层构造）
 func ps_e_ternary() -> i64 {
-    var left = ps_e_or()
+    var left = ps_bin(3)
     if left < 0 {
         return -1
     }
