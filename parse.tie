@@ -27,6 +27,7 @@ const PS_B_REST: i64 = 1;       // A_BIND：剩余（...rest）
 
 // ---------- 词元前瞻队列（容量小；出队即前移） ----------
 var ps_dead: bool = false;
+var ps_gt_pend: i64 = 0;        // 类型位 `>>` 拆分余量（嵌套泛型 `table<table<i64>>`）
 var pq_tag: table<i64> = [];
 var pq_line: table<i64> = [];
 var pq_col: table<i64> = [];
@@ -235,6 +236,20 @@ func ps_expect(kind: i64, what: string) -> bool {
     return false
 }
 
+// 类型位 '>'：嵌套泛型收尾的 `>>`（词法为单个 Shr 词元）拆成两个 '>'
+func ps_expect_gt() -> bool {
+    if ps_gt_pend > 0 {
+        ps_gt_pend = ps_gt_pend - 1
+        return true
+    }
+    if ps_kind(0) == K_SHR {
+        ps_adv()
+        ps_gt_pend = ps_gt_pend + 1
+        return true
+    }
+    return ps_expect(K_GT, "'>'")
+}
+
 // 期望标识符；返回名 id（失败 -1）
 func ps_expect_ident() -> i64 {
     if ps_kind(0) == K_IDENT {
@@ -367,11 +382,13 @@ func ps_type() -> i64 {
     }
     // 元组类型 (a: T, b: T) / (T, T)
     if k == K_LPAREN {
+        var lp_l = ps_line(0)
+        var lp_c = ps_col(0)
         ps_adv()
         var n2 = em_new(T_T_TUPLE)
         var els: table<i64> = []
         if ps_kind(0) == K_RPAREN {
-            ps_err_here("空元组类型 () 不支持")
+            em_fail(lp_l, lp_c, "空元组类型 () 不支持")
             return -1
         }
         while true {
@@ -434,7 +451,7 @@ func ps_type() -> i64 {
             }
             break
         }
-        if !ps_expect(K_GT, "'>'") {
+        if !ps_expect_gt() {
             return -1
         }
         ps_set_seg(ap, 2, args2)
@@ -778,6 +795,15 @@ func ps_table_lit() -> i64 {
         ps_set_seg(e0, 1, e0l)
         return e0
     }
+    // 空映射 [:]（与空表 [] 相区分）
+    if ps_kind(0) == K_COLON && ps_kind(1) == K_RBRACKET {
+        ps_adv()
+        ps_adv()
+        var em0 = em_new(T_E_MAP)
+        var em0l: table<i64> = []
+        ps_set_seg(em0, 1, em0l)
+        return em0
+    }
     var first = ps_expr()
     if first < 0 {
         return -1
@@ -792,7 +818,8 @@ func ps_table_lit() -> i64 {
         table_push(entries, first)
         while true {
             if ps_kind(0) != K_COLON {
-                ps_err_here("记录字面量元素必须是 '键: 值'（键为标识符或字符串字面量），实际是 " + ps_kdesc(0))
+                // 后续键无冒号：按元素分隔期待报错（对齐现管线）
+                ps_err_here("期望 , 或 ; 或 ]，实际是 " + ps_kdesc(0))
                 return -1
             }
             ps_adv()
@@ -1599,6 +1626,12 @@ func ps_param() -> i64 {
             is_var = 1
             ps_adv()
         }
+        // 历史拼写：`x: ref T`（ref 在类型位；与名字前修饰同义——
+        // 「两处都写按已置位处理」；生态全仓大量在用）
+        if ps_kind(0) == KW_REF {
+            ps_adv()
+            conv = 1
+        }
         ty_l = ps_line(0)
         ty_c = ps_col(0)
         ty = ps_type()
@@ -1609,10 +1642,6 @@ func ps_param() -> i64 {
     if is_var == 1 {
         if conv == 1 {
             em_fail(ty_l, ty_c, "变参参数不能同时使用 ref 修饰")
-            return -1
-        }
-        if conv == 2 {
-            em_fail(ty_l, ty_c, "变参参数不能同时使用 immut 修饰")
             return -1
         }
         conv = 3
@@ -2239,8 +2268,30 @@ func ps_enum_decl(is_pub: i64) -> i64 {
         var payload: table<i64> = table_new_i64()
         if ps_kind(0) == K_LPAREN {
             ps_adv()
-            if !ps_params(payload) {
-                return -1
+            while ps_kind(0) != K_RPAREN {
+                var pl_it: i64 = 0
+                if ps_kind(0) == K_IDENT && ps_kind(1) == K_COLON {
+                    pl_it = ps_param()         // 带名载荷 `name: T`（规范形态）
+                } else if ps_kind(0) == KW_REF || ps_kind(0) == KW_IMMUT {
+                    pl_it = ps_param()         // 修饰形态（宽容）
+                } else {
+                    var pl_ty = ps_type()      // 裸类型载荷（生态形态）
+                    if pl_ty < 0 {
+                        return -1
+                    }
+                    pl_it = em_new(T_A_PARAM)
+                    em_put(pl_it, 1, 0 - 1)
+                    em_put(pl_it, 2, pl_ty)
+                }
+                if pl_it < 0 {
+                    return -1
+                }
+                table_push(payload, pl_it)
+                if ps_kind(0) == K_COMMA {
+                    ps_adv()
+                    continue
+                }
+                break
             }
             if !ps_expect(K_RPAREN, "')'") {
                 return -1
@@ -2362,7 +2413,7 @@ func ps_top_item() -> i64 {
         if k2 == KW_ENUM {
             return ps_enum_decl(1)
         }
-        ps_err_here("期望 func/var/const/enum，实际是 " + ps_kdesc(0))
+        ps_err_here("期望 'func'，实际是 " + ps_kdesc(0))
         return -1
     }
     if k == KW_FUNC {
@@ -2425,6 +2476,7 @@ func ps_decl_block() -> i64 {
 pub func ps_parse(src: string) -> i64 {
     em_reset()
     ps_dead = false
+    ps_gt_pend = 0
     pq_clear()
     var body = ps_strip_header(src)
     lx_start(body)
