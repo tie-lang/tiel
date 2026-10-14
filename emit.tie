@@ -9,9 +9,12 @@ type tie<class>
 //   * 名表：名池 em_names + 开放寻址哈希桶 em_bk（FNV-1a 32 位，
 //     负载 > 3/4 时双倍重建）；桶内值 = 名 id + 1（0 表示空桶）。
 //   * 字面量不复制文本：节点存源区段（em_src 偏移 + 长度），消费方按需解析。
-//   * 错误面：单错误槽（首错即停），line / col / msg 访问器。
+//   * 错误面：单错误槽（首错即停），line / col / msg / code 访问器；
+//     code 在置错时经 emcodes 的表查询填入（E 码）。
 // 口径：内存第一（零中间物、紧凑定长、名字共用一份）；安全（非法 id 访问
 // 一律安全返回，不越界）。符号前缀 em_（多文件合并防撞）。
+
+import "./emcodes.tie"
 
 // ---------- tag 常量：表达式 ----------
 pub const T_E_INT: i64 = 1;        // 源区段(2) + 进制标记
@@ -99,6 +102,7 @@ pub var em_src: string = "";            // 源文本（当前会话保留一份�
 var em_err_l: i64 = 0;
 var em_err_c: i64 = 0;
 var em_err_m: string = "";
+var em_err_x: string = "";  // 错误码（E 码；置错时经 ec_lookup 填入）
 var em_err_k: i64 = 0;      // 错误类别：0 无 / 1 词法 / 2 语法
 var em_has_err: bool = false;
 
@@ -329,6 +333,7 @@ pub func em_clear_err() {
     em_err_l = 0
     em_err_c = 0
     em_err_m = ""
+    em_err_x = ""
     em_err_k = 0
     em_has_err = false
 }
@@ -341,6 +346,7 @@ pub func em_fail_k(k: i64, line: i64, col: i64, msg: string) {
     em_err_l = line
     em_err_c = col
     em_err_m = msg
+    em_err_x = ec_lookup(msg)
     em_has_err = true
 }
 
@@ -372,6 +378,10 @@ pub func em_err_col() -> i64 {
 
 pub func em_err_msg() -> string {
     return em_err_m
+}
+
+pub func em_err_code() -> string {
+    return em_err_x
 }
 
 // ---------- 自检与统计 ----------
