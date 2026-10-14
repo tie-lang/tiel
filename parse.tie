@@ -1,0 +1,2393 @@
+type tie<class>
+// parse.tie —— tiel 前端的递归下降语法分析器（直写 emit 表示层）
+// ============================================================
+// 形态：两词元以上前瞻（小队列），递归下降，覆盖 tsc 规范全部构造。
+//   入口 ps_parse(src)：头部保行剥离 → lx_start → 顶层块（S_BLOCK）→ 返回根 id。
+//
+// 两条核心纪律：
+//   1) 区段不交错——凡「列表」的落池必须在所有子项解析完成之后统一执行
+//      （ps_set_seg）：先收集为局部表，最后原子性 push 进 em_ch。若边解析
+//      边 push，父区段会把子项的内部列表一并覆盖，区段即告失效。
+//   2) 首错即停——错误经 em_fail 置入（与词法共用错误槽）；词法拉取失败后
+//      不再拉取（ps_dead），队列补假 EOF，让上层自然短路返回。
+//
+// 错误消息：与现管线逐字对齐（describe 表 + 消息库均取自现管线实测）。
+// 已知简化（后续批次）：短闭包与管道在语法层同构（均为 E_PIPE，语义层区分）；
+//   切片=索引+范围（E_INDEX+E_RANGE，空端点=0）；switch 模式=表达式树
+//   （绑定识别留语义层）；省略标注的返回值/参数不报错（宽容）。
+// 前缀 ps_。
+
+import "./lex.tie"
+
+// ---------- 标志位 ----------
+const PS_F_CONST: i64 = 1;      // D_VAR：const
+const PS_F_GLOBAL: i64 = 2;     // D_VAR：全局
+const PS_F_PUB: i64 = 4;        // D_VAR / D_FUNC：pub
+const PS_B_REST: i64 = 1;       // A_BIND：剩余（...rest）
+
+// ---------- 词元前瞻队列（容量小；出队即前移） ----------
+var ps_dead: bool = false;
+var pq_tag: table<i64> = [];
+var pq_line: table<i64> = [];
+var pq_col: table<i64> = [];
+var pq_off: table<i64> = [];
+var pq_len: table<i64> = [];
+var pq_id: table<i64> = [];
+
+// 入队一次（lx 当前词元快照）
+func pq_push_cur() {
+    table_push(pq_tag, lx_kind())
+    table_push(pq_line, lx_line())
+    table_push(pq_col, lx_col())
+    table_push(pq_off, lx_pos_off())
+    table_push(pq_len, lx_pos_len())
+    table_push(pq_id, lx_nameid())
+}
+
+// 出队（前移 + 收缩）
+func pq_shift() {
+    var i: i64 = 1
+    var n = len(pq_tag)
+    while i < n {
+        pq_tag[i - 1] = pq_tag[i]
+        pq_line[i - 1] = pq_line[i]
+        pq_col[i - 1] = pq_col[i]
+        pq_off[i - 1] = pq_off[i]
+        pq_len[i - 1] = pq_len[i]
+        pq_id[i - 1] = pq_id[i]
+        i = i + 1
+    }
+    table_pop(pq_tag)
+    table_pop(pq_line)
+    table_pop(pq_col)
+    table_pop(pq_off)
+    table_pop(pq_len)
+    table_pop(pq_id)
+}
+
+func pq_clear() {
+    while len(pq_tag) > 0 {
+        pq_shift()
+    }
+}
+
+// 确保队列中至少 k+1 个词元（词法错后补假 EOF，首错即停保证词法错保留）
+func ps_ensure(k: i64) {
+    while len(pq_tag) <= k {
+        if ps_dead {
+            table_push(pq_tag, K_EOF)
+            table_push(pq_line, lx_line())
+            table_push(pq_col, lx_col())
+            table_push(pq_off, 0)
+            table_push(pq_len, 0)
+            table_push(pq_id, -1)
+        } else {
+            if lx_next() {
+                pq_push_cur()
+            } else {
+                ps_dead = true
+                table_push(pq_tag, K_EOF)
+                table_push(pq_line, lx_line())
+                table_push(pq_col, lx_col())
+                table_push(pq_off, 0)
+                table_push(pq_len, 0)
+                table_push(pq_id, -1)
+            }
+        }
+    }
+}
+
+func ps_kind(k: i64) -> i64 {
+    ps_ensure(k)
+    return pq_tag[k]
+}
+
+func ps_line(k: i64) -> i64 {
+    ps_ensure(k)
+    return pq_line[k]
+}
+
+func ps_col(k: i64) -> i64 {
+    ps_ensure(k)
+    return pq_col[k]
+}
+
+func ps_text(k: i64) -> string {
+    ps_ensure(k)
+    return str_sub_bytes(em_src, pq_off[k], pq_off[k] + pq_len[k])
+}
+
+func ps_qid(k: i64) -> i64 {
+    ps_ensure(k)
+    return pq_id[k]
+}
+
+func ps_adv() {
+    ps_ensure(0)
+    pq_shift()
+}
+
+// ---------- 词元描述（describe；对齐现管线的调试名） ----------
+var ps_tn_k: table<i64> = [K_INT, K_FLOAT, K_STR, K_CHAR, K_IDENT,
+    KW_FUNC, KW_VAR, KW_CONST, KW_IF, KW_ELSE, KW_WHILE, KW_FOR, KW_IN, KW_RETURN,
+    KW_BREAK, KW_CONTINUE, KW_SWITCH, KW_CASE, KW_DEFAULT, KW_IMPORT, KW_AS,
+    KW_NAMESPACE, KW_PUB, KW_USING, KW_TRUE, KW_FALSE, KW_ZERO, KW_REF, KW_IMMUT,
+    KW_ENUM, KW_PANIC, KW_IS,
+    K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_COMMA,
+    K_COLON, K_SEMI, K_DOT, K_DOTDOT, K_DOTDOTEQ, K_ELLIPSIS, K_ARROW, K_LARROW,
+    K_PLUS, K_MINUS, K_STAR, K_SLASH, K_PERCENT, K_STARSTAR, K_BACKSLASH,
+    K_PERCENTPERCENT, K_EQ, K_EQEQ, K_NOTEQ, K_LT, K_GT, K_LE, K_GE, K_ANDAND,
+    K_OROR, K_BANG, K_AMP, K_PIPE, K_CARET, K_SHL, K_SHR, K_TILDE, K_INC, K_DEC,
+    K_QUESTION, K_QDOT, K_QCOLON, K_QBRACKET, K_PLUSEQ, K_MINUSEQ, K_STAREQ,
+    K_SLASHEQ, K_PERCENTEQ, K_PERCENTPPEQ, K_BACKSLASHEQ, K_AMPEQ, K_PIPEEQ,
+    K_CARETEQ, K_SHLEQ, K_SHREQ, K_ELLIPSIS, K_EOF];
+
+var ps_tn_s: table<string> = ["Int", "Float", "Str", "CharLit", "Ident",
+    "Func", "Var", "Const", "If", "Else", "While", "For", "In", "Return",
+    "Break", "Continue", "Switch", "Case", "Default", "Import", "As",
+    "Namespace", "Pub", "Using", "True", "False", "Zero", "Ref", "Immut",
+    "Enum", "Panic", "Is",
+    "LParen", "RParen", "LBrace", "RBrace", "LBracket", "RBracket", "Comma",
+    "Colon", "Semi", "Dot", "DotDot", "DotDotEq", "Ellipsis", "Arrow", "LArrow",
+    "Plus", "Minus", "Star", "Slash", "Percent", "StarStar", "Backslash",
+    "PercentPercent", "Eq", "EqEq", "NotEq", "Lt", "Gt", "Le", "Ge", "AndAnd",
+    "OrOr", "Bang", "Amp", "Pipe", "Caret", "Shl", "Shr", "Tilde", "Inc", "Dec",
+    "Question", "QDot", "QColon", "QBracket", "PlusEq", "MinusEq", "StarEq",
+    "SlashEq", "PercentEq", "PercentPpEq", "BackslashEq", "AmpEq", "PipeEq",
+    "CaretEq", "ShlEq", "ShrEq", "Ellipsis", "Eof"];
+
+func ps_tokname(k: i64) -> string {
+    var i: i64 = 0
+    while i < len(ps_tn_k) {
+        if ps_tn_k[i] == k {
+            return ps_tn_s[i]
+        }
+        i = i + 1
+    }
+    return "Kind" + to_string(k)
+}
+
+// 类型词（关键字中的类型名集合）
+func ps_is_typeword(k: i64) -> bool {
+    if k >= KW_I128 && k <= KW_I8 {
+        return true
+    }
+    if k >= KW_U128 && k <= KW_U8 {
+        return true
+    }
+    if k == KW_F32 || k == KW_F64 || k == KW_BOOL || k == KW_CHAR || k == KW_STRING {
+        return true
+    }
+    if k == KW_TRIT || k == KW_VOID || k == KW_TABLE || k == KW_MAP {
+        return true
+    }
+    if k == KW_NUM || k == KW_TEXT || k == KW_MISC || k == KW_ANY {
+        return true
+    }
+    return false
+}
+
+func ps_desc(kind: i64, txt: string) -> string {
+    if kind == K_IDENT {
+        return "标识符 '" + txt + "'"
+    }
+    if kind == K_INT {
+        return "整数 " + txt
+    }
+    if kind == K_FLOAT {
+        return "浮点数 " + txt
+    }
+    if kind == K_STR || kind == K_INTERP {
+        return "字符串"
+    }
+    if kind == K_SEMI {
+        return "分号"
+    }
+    if kind == K_EOF {
+        return "文件结束"
+    }
+    if ps_is_typeword(kind) {
+        return "类型 '" + txt + "'"
+    }
+    return ps_tokname(kind)
+}
+
+func ps_kdesc(k: i64) -> string {
+    return ps_desc(ps_kind(k), ps_text(k))
+}
+
+// ---------- 错误 ----------
+func ps_err_here(msg: string) {
+    em_fail(ps_line(0), ps_col(0), msg)
+}
+
+func ps_err_at(k: i64, msg: string) {
+    em_fail(ps_line(k), ps_col(k), msg)
+}
+
+// 期望某词元（消费）；失败报「期望 X，实际是 Y」
+func ps_expect(kind: i64, what: string) -> bool {
+    if ps_kind(0) == kind {
+        ps_adv()
+        return true
+    }
+    ps_err_here("期望 " + what + "，实际是 " + ps_kdesc(0))
+    return false
+}
+
+// 期望标识符；返回名 id（失败 -1）
+func ps_expect_ident() -> i64 {
+    if ps_kind(0) == K_IDENT {
+        var nid = ps_qid(0)
+        ps_adv()
+        return nid
+    }
+    ps_err_here("期望标识符，实际是 " + ps_kdesc(0))
+    return -1
+}
+
+// ---------- 区段落池（纪律：子项全部解析完之后统一执行） ----------
+func ps_set_seg(node: i64, slot: i64, lst: table<i64>) {
+    var st = len(em_ch)
+    var i: i64 = 0
+    while i < len(lst) {
+        table_push(em_ch, lst[i])
+        i = i + 1
+    }
+    em_put(node, slot, st)
+    em_put(node, slot + 1, len(lst))
+}
+
+// ---------- 头部保行剥离（声明行 → 空行；行数守恒） ----------
+func ps_line_prefix(src: string, a: i64, b: i64, pref: string) -> bool {
+    var pl = len(pref)
+    if b - a < pl {
+        return false
+    }
+    var i: i64 = 0
+    while i < pl {
+        if str_byte(src, a + i) != str_byte(pref, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+pub func ps_strip_header(src: string) -> string {
+    var sb = string_builder()
+    var n = len(src)
+    var i: i64 = 0
+    var in_header = true
+    var cnt: i64 = 0
+    while i <= n {
+        var j = i
+        while j < n && str_byte(src, j) != 10 {
+            j = j + 1
+        }
+        var emit_blank = false
+        if in_header {
+            var t = i
+            while t < j && (str_byte(src, t) == 32 || str_byte(src, t) == 9) {
+                t = t + 1
+            }
+            if t == j {
+                emit_blank = true
+            } else if ps_line_prefix(src, t, j, "type tie") {
+                emit_blank = true
+            } else {
+                in_header = false
+            }
+        }
+        if cnt > 0 {
+            sb_append(sb, "\n")
+        }
+        cnt = cnt + 1
+        if !emit_blank {
+            sb_append(sb, str_sub_bytes(src, i, j))
+        }
+        i = j + 1
+    }
+    return sb_build(sb)
+}
+
+// ---------- 类型解析 ----------
+func ps_type_name() -> i64 {
+    // 类型词（共用「类型 'x'」描述）或用户类型名
+    var k = ps_kind(0)
+    if ps_is_typeword(k) {
+        ps_adv()
+        return em_nameid(ps_text(0))
+    }
+    if k == K_IDENT {
+        var nid = ps_qid(0)
+        ps_adv()
+        return nid
+    }
+    ps_err_here("期望类型，实际是 " + ps_kdesc(0))
+    return -1
+}
+
+func ps_type() -> i64 {
+    var k = ps_kind(0)
+    // fn(...) -> R
+    if k == K_IDENT && ps_text(0) == "fn" && ps_kind(1) == K_LPAREN {
+        ps_adv()
+        ps_adv()
+        var n = em_new(T_T_FN)
+        var args: table<i64> = []
+        if ps_kind(0) != K_RPAREN {
+            while true {
+                var at = ps_type()
+                if at < 0 {
+                    return -1
+                }
+                table_push(args, at)
+                if ps_kind(0) == K_COMMA {
+                    ps_adv()
+                    continue
+                }
+                break
+            }
+        }
+        if !ps_expect(K_RPAREN, "(") {
+            return -1
+        }
+        var ret: i64 = 0
+        if ps_kind(0) == K_ARROW {
+            ps_adv()
+            ret = ps_type()
+            if ret < 0 {
+                return -1
+            }
+        }
+        em_put(n, 3, ret)
+        ps_set_seg(n, 1, args)
+        return n
+    }
+    // 元组类型 (a: T, b: T) / (T, T)
+    if k == K_LPAREN {
+        ps_adv()
+        var n2 = em_new(T_T_TUPLE)
+        var els: table<i64> = []
+        if ps_kind(0) == K_RPAREN {
+            ps_err_here("空元组类型 () 不支持")
+            return -1
+        }
+        while true {
+            // 命名分量：ident ':' type（否则纯类型）
+            if ps_kind(0) == K_IDENT && ps_kind(1) == K_COLON {
+                var fname = ps_qid(0)
+                ps_adv()
+                ps_adv()
+                var ft = ps_type()
+                if ft < 0 {
+                    return -1
+                }
+                var fa = em_new(T_A_PARAM)
+                em_put(fa, 1, fname)
+                em_put(fa, 2, ft)
+                table_push(els, fa)
+            } else {
+                var et = ps_type()
+                if et < 0 {
+                    return -1
+                }
+                table_push(els, et)
+            }
+            if ps_kind(0) == K_COMMA {
+                ps_adv()
+                if ps_kind(0) == K_RPAREN {
+                    break
+                }
+                continue
+            }
+            break
+        }
+        if !ps_expect(K_RPAREN, "(") {
+            return -1
+        }
+        ps_set_seg(n2, 1, els)
+        return n2
+    }
+    // 基本/命名类型 + 可选 < 参数 >
+    var base = ps_type_name()
+    if base < 0 {
+        return -1
+    }
+    var n3 = em_new(T_T_NAME)
+    em_put(n3, 1, base)
+    if ps_kind(0) == K_LT {
+        ps_adv()
+        var ap = em_new(T_T_APPLY)
+        em_put(ap, 1, n3)
+        var args2: table<i64> = []
+        while true {
+            var at2 = ps_type()
+            if at2 < 0 {
+                return -1
+            }
+            table_push(args2, at2)
+            if ps_kind(0) == K_COMMA {
+                ps_adv()
+                continue
+            }
+            break
+        }
+        if !ps_expect(K_GT, ">") {
+            return -1
+        }
+        ps_set_seg(ap, 2, args2)
+        return ap
+    }
+    return n3
+}
+
+// ---------- 表达式：字面量/主元 ----------
+func ps_is_lit_start(k: i64) -> bool {
+    if k == K_INT || k == K_FLOAT || k == K_STR || k == K_INTERP || k == K_CHAR {
+        return true
+    }
+    if k == KW_TRUE || k == KW_FALSE || k == KW_ZERO {
+        return true
+    }
+    return false
+}
+
+// if 表达式（表达式位）
+func ps_ifexpr() -> i64 {
+    ps_adv()                                   // if
+    var cond = ps_expr()
+    if cond < 0 {
+        return -1
+    }
+    if !ps_expect(K_LBRACE, "{") {
+        return -1
+    }
+    var then_e = ps_expr()
+    if then_e < 0 {
+        return -1
+    }
+    if !ps_expect(K_RBRACE, "}") {
+        return -1
+    }
+    if ps_kind(0) != KW_ELSE {
+        ps_err_here("if 表达式必须有 else 分支（表达式位 if 须产出值）")
+        return -1
+    }
+    ps_adv()
+    var else_e: i64 = 0
+    if ps_kind(0) == KW_IF {
+        else_e = ps_ifexpr()
+    } else {
+        if !ps_expect(K_LBRACE, "{") {
+            return -1
+        }
+        else_e = ps_expr()
+        if else_e < 0 {
+            return -1
+        }
+        if !ps_expect(K_RBRACE, "}") {
+            return -1
+        }
+    }
+    if else_e < 0 {
+        return -1
+    }
+    var n = em_new(T_E_IFEXPR)
+    em_put(n, 1, cond)
+    em_put(n, 2, then_e)
+    em_put(n, 3, else_e)
+    return n
+}
+
+// switch 表达式（表达式位；分支以 -> 书写）
+func ps_switchexpr() -> i64 {
+    ps_adv()                                   // switch
+    var obj = ps_expr()
+    if obj < 0 {
+        return -1
+    }
+    if !ps_expect(K_LBRACE, "{") {
+        return -1
+    }
+    var cases: table<i64> = []
+    var seen_wild: i64 = 0
+    while true {
+        if ps_kind(0) == K_RBRACE {
+            ps_adv()
+            break
+        }
+        if ps_kind(0) == K_EOF {
+            ps_err_here("期望 ，或；或 }，实际是 " + ps_kdesc(0))
+            return -1
+        }
+        // 模式（可为 `_` 通配）
+        var pat = ps_pattern()
+        if pat < 0 {
+            return -1
+        }
+        if em_tag(pat) == T_E_IDENT {
+            if em_namestr(em_get(pat, 1)) == "_" {
+                if seen_wild != 0 {
+                    ps_err_here("switch 表达式不允许重复的 `_` 通配臂")
+                    return -1
+                }
+                seen_wild = 1
+            }
+        }
+        if !ps_expect(K_ARROW, "->") {
+            return -1
+        }
+        var body = ps_expr()
+        if body < 0 {
+            return -1
+        }
+        var c = em_new(T_A_CASE)
+        em_put(c, 3, body)
+        var pats: table<i64> = []
+        table_push(pats, pat)
+        ps_set_seg(c, 1, pats)
+        table_push(cases, c)
+        if ps_kind(0) == K_COMMA {
+            ps_adv()
+            continue
+        }
+        if ps_kind(0) == K_RBRACE {
+            continue
+        }
+        ps_err_here("switch 表达式分支之间需用 ',' 或右花括号 '}' 分隔，实际是 " + ps_kdesc(0))
+        return -1
+    }
+    var n = em_new(T_E_SWITCHEXPR)
+    em_put(n, 1, obj)
+    ps_set_seg(n, 2, cases)
+    return n
+}
+
+// 模式（switch 分支目标）：不含管道层，含可选范围；`_` 由调用方识别
+func ps_pattern() -> i64 {
+    var left = ps_e_defval()
+    if left < 0 {
+        return -1
+    }
+    var k = ps_kind(0)
+    if k == K_DOTDOT || k == K_DOTDOTEQ {
+        var incl: i64 = 0
+        if k == K_DOTDOTEQ {
+            incl = 1
+        }
+        ps_adv()
+        var r = ps_e_defval()
+        if r < 0 {
+            return -1
+        }
+        var n = em_new(T_E_RANGE)
+        em_put(n, 1, left)
+        em_put(n, 2, r)
+        em_put(n, 3, incl)
+        return n
+    }
+    return left
+}
+
+// 闭包字面量（func ( params ) -> R { body }）
+func ps_closure() -> i64 {
+    ps_adv()                                   // func
+    if !ps_expect(K_LPAREN, "(") {
+        return -1
+    }
+    var sig: table<i64> = table_new_i64()
+    table_push(sig, 0)                         // 返回类型占位
+    if ps_kind(0) != K_RPAREN {
+        while true {
+            var p = ps_param()
+            if p < 0 {
+                return -1
+            }
+            table_push(sig, p)
+            if ps_kind(0) == K_COMMA {
+                ps_adv()
+                continue
+            }
+            break
+        }
+    }
+    if !ps_expect(K_RPAREN, "(") {
+        return -1
+    }
+    if ps_kind(0) == K_ARROW {
+        ps_adv()
+        var ret = ps_type()
+        if ret < 0 {
+            return -1
+        }
+        sig[0] = ret
+    }
+    if ps_kind(0) != K_LBRACE {
+        ps_err_here("闭包函数体必须是以 '{' 开始的代码块")
+        return -1
+    }
+    var body = ps_block()
+    if body < 0 {
+        return -1
+    }
+    var n = em_new(T_E_CLOSURE)
+    em_put(n, 3, body)
+    ps_set_seg(n, 1, sig)
+    return n
+}
+
+func ps_primary() -> i64 {
+    var k = ps_kind(0)
+    if k == K_INT {
+        var n = em_new(T_E_INT)
+        em_put(n, 1, ps_off_of(0))
+        em_put(n, 2, ps_len_of(0))
+        ps_adv()
+        return n
+    }
+    if k == K_FLOAT {
+        var n2 = em_new(T_E_FLOAT)
+        em_put(n2, 1, ps_off_of(0))
+        em_put(n2, 2, ps_len_of(0))
+        ps_adv()
+        return n2
+    }
+    if k == K_STR {
+        var n3 = em_new(T_E_STR)
+        em_put(n3, 1, ps_off_of(0))
+        em_put(n3, 2, ps_len_of(0))
+        ps_adv()
+        return n3
+    }
+    if k == K_INTERP {
+        var n4 = em_new(T_E_INTERP)
+        em_put(n4, 1, ps_off_of(0))
+        em_put(n4, 2, ps_len_of(0))
+        ps_adv()
+        return n4
+    }
+    if k == K_CHAR {
+        var n5 = em_new(T_E_CHAR)
+        em_put(n5, 1, ps_off_of(0))
+        em_put(n5, 2, ps_len_of(0))
+        ps_adv()
+        return n5
+    }
+    if k == KW_TRUE || k == KW_FALSE {
+        var n6 = em_new(T_E_BOOL)
+        if k == KW_TRUE {
+            em_put(n6, 1, 1)
+        } else {
+            em_put(n6, 1, 0)
+        }
+        ps_adv()
+        return n6
+    }
+    if k == KW_ZERO {
+        var n7 = em_new(T_E_TRIT)
+        em_put(n7, 1, 0)
+        ps_adv()
+        return n7
+    }
+    if k == K_IDENT {
+        var nid = ps_qid(0)
+        ps_adv()
+        var n8 = em_new(T_E_IDENT)
+        em_put(n8, 1, nid)
+        return n8
+    }
+    if k == K_LPAREN {
+        return ps_paren_tuple()
+    }
+    if k == K_LBRACKET {
+        return ps_table_lit()
+    }
+    if k == KW_IF {
+        return ps_ifexpr()
+    }
+    if k == KW_SWITCH {
+        return ps_switchexpr()
+    }
+    if k == KW_FUNC {
+        return ps_closure()
+    }
+    ps_err_here("无法以 " + ps_kdesc(0) + " 开始表达式")
+    return -1
+}
+
+// 队列区段访问
+func ps_off_of(k: i64) -> i64 {
+    ps_ensure(k)
+    return pq_off[k]
+}
+
+func ps_len_of(k: i64) -> i64 {
+    ps_ensure(k)
+    return pq_len[k]
+}
+
+// 括号：分组 或 元组字面量
+func ps_paren_tuple() -> i64 {
+    ps_adv()                                   // (
+    if ps_kind(0) == K_RPAREN {
+        ps_err_here("空元组 () 不支持")
+        return -1
+    }
+    var first = ps_expr()
+    if first < 0 {
+        return -1
+    }
+    if ps_kind(0) == K_COMMA {
+        var els: table<i64> = []
+        table_push(els, first)
+        while ps_kind(0) == K_COMMA {
+            ps_adv()
+            if ps_kind(0) == K_RPAREN {
+                break
+            }
+            var e = ps_expr()
+            if e < 0 {
+                return -1
+            }
+            table_push(els, e)
+        }
+        if !ps_expect(K_RPAREN, "(") {
+            return -1
+        }
+        var t = em_new(T_E_TUPLE)
+        ps_set_seg(t, 1, els)
+        return t
+    }
+    if !ps_expect(K_RPAREN, "(") {
+        return -1
+    }
+    return first
+}
+
+// 表字面量 / 映射字面量 / 集合综合
+func ps_table_lit() -> i64 {
+    ps_adv()                                   // [
+    if ps_kind(0) == K_RBRACKET {
+        ps_adv()
+        var e0 = em_new(T_E_TABLE)
+        var e0l: table<i64> = []
+        ps_set_seg(e0, 1, e0l)
+        return e0
+    }
+    var first = ps_expr()
+    if first < 0 {
+        return -1
+    }
+    // 集合综合：[expr for ...]
+    if ps_kind(0) == KW_FOR {
+        return ps_comp_tail(first)
+    }
+    // 映射：[k: v, ...]
+    if ps_kind(0) == K_COLON {
+        var entries: table<i64> = []
+        table_push(entries, first)
+        while true {
+            if ps_kind(0) != K_COLON {
+                ps_err_here("记录字面量元素必须是 '键: 值'（键为标识符或字符串字面量），实际是 " + ps_kdesc(0))
+                return -1
+            }
+            ps_adv()
+            var v = ps_expr()
+            if v < 0 {
+                return -1
+            }
+            table_push(entries, v)
+            if ps_kind(0) == K_COMMA {
+                ps_adv()
+                if ps_kind(0) == K_RBRACKET {
+                    break
+                }
+                var k2 = ps_expr()
+                if k2 < 0 {
+                    return -1
+                }
+                table_push(entries, k2)
+                continue
+            }
+            break
+        }
+        if !ps_expect(K_RBRACKET, "]") {
+            return -1
+        }
+        var m = em_new(T_E_MAP)
+        ps_set_seg(m, 1, entries)
+        return m
+    }
+    // 表元素列表
+    var els: table<i64> = []
+    table_push(els, first)
+    while ps_kind(0) == K_COMMA {
+        ps_adv()
+        if ps_kind(0) == K_RBRACKET {
+            break
+        }
+        var e = ps_expr()
+        if e < 0 {
+            return -1
+        }
+        table_push(els, e)
+    }
+    if !ps_expect(K_RBRACKET, "]") {
+        return -1
+    }
+    var t = em_new(T_E_TABLE)
+    ps_set_seg(t, 1, els)
+    return t
+}
+
+// 综合尾部：for name in src [for ...] [if cond] ]  （首元素已解析）
+func ps_comp_tail(sel: i64) -> i64 {
+    var names: table<i64> = []
+    var srcs: table<i64> = []
+    while ps_kind(0) == KW_FOR {
+        ps_adv()
+        var nid = ps_expect_ident()
+        if nid < 0 {
+            return -1
+        }
+        if !ps_expect(KW_IN, "in") {
+            return -1
+        }
+        var s = ps_expr()
+        if s < 0 {
+            return -1
+        }
+        table_push(names, nid)
+        table_push(srcs, s)
+    }
+    var cond: i64 = 0
+    if ps_kind(0) == KW_IF {
+        ps_adv()
+        cond = ps_expr()
+        if cond < 0 {
+            return -1
+        }
+    }
+    if !ps_expect(K_RBRACKET, "]") {
+        return -1
+    }
+    // 从内往外组装（cond 挂在最内层）
+    var body = sel
+    var i = len(names) - 1
+    while i >= 0 {
+        var c = em_new(T_E_COMP)
+        em_put(c, 1, names[i])
+        em_put(c, 2, srcs[i])
+        if i == len(names) - 1 {
+            em_put(c, 3, cond)
+        } else {
+            em_put(c, 3, 0)
+        }
+        em_put(c, 4, body)
+        body = c
+        i = i - 1
+    }
+    return body
+}
+
+// ---------- 表达式：后缀 ----------
+func ps_e_postfix() -> i64 {
+    var left = ps_primary()
+    if left < 0 {
+        return -1
+    }
+    while true {
+        var k = ps_kind(0)
+        if k == K_LPAREN {
+            // 调用
+            ps_adv()
+            var args: table<i64> = []
+            if ps_kind(0) != K_RPAREN {
+                while true {
+                    var a = ps_arg()
+                    if a < 0 {
+                        return -1
+                    }
+                    table_push(args, a)
+                    if ps_kind(0) == K_COMMA {
+                        ps_adv()
+                        continue
+                    }
+                    break
+                }
+            }
+            if !ps_expect(K_RPAREN, "(") {
+                return -1
+            }
+            var c = em_new(T_E_CALL)
+            em_put(c, 1, left)
+            ps_set_seg(c, 2, args)
+            left = c
+        } else if k == K_LBRACKET {
+            ps_adv()
+            var idx = ps_index_tail()
+            if idx < 0 {
+                return -1
+            }
+            if !ps_expect(K_RBRACKET, "]") {
+                return -1
+            }
+            var ix = em_new(T_E_INDEX)
+            em_put(ix, 1, left)
+            em_put(ix, 2, idx)
+            left = ix
+        } else if k == K_DOT {
+            ps_adv()
+            var fname = ps_field_name()
+            if fname < 0 {
+                return -1
+            }
+            var fl = em_new(T_E_FIELD)
+            em_put(fl, 1, left)
+            em_put(fl, 2, fname)
+            left = fl
+        } else if k == K_QDOT {
+            ps_adv()
+            var fname2 = ps_field_name()
+            if fname2 < 0 {
+                return -1
+            }
+            var sub = em_new(T_E_IDENT)
+            em_put(sub, 1, fname2)
+            var oc = em_new(T_E_OPTCHAIN)
+            em_put(oc, 1, left)
+            em_put(oc, 2, sub)
+            left = oc
+        } else if k == K_QBRACKET {
+            ps_adv()
+            var idx2 = ps_index_tail()
+            if idx2 < 0 {
+                return -1
+            }
+            if !ps_expect(K_RBRACKET, "]") {
+                return -1
+            }
+            var oc2 = em_new(T_E_OPTCHAIN)
+            em_put(oc2, 1, left)
+            em_put(oc2, 2, idx2)
+            left = oc2
+        } else if k == K_QUESTION {
+            ps_adv()
+            var tp = em_new(T_E_TRYPOP)
+            em_put(tp, 1, left)
+            left = tp
+        } else if k == K_INC || k == K_DEC {
+            ps_adv()
+            var un = em_new(T_E_UN)
+            em_put(un, 1, k)
+            em_put(un, 2, left)
+            left = un
+        } else if k == K_ELLIPSIS {
+            ps_adv()
+            var uw = em_new(T_E_UNWRAP)
+            em_put(uw, 1, left)
+            left = uw
+        } else {
+            break
+        }
+    }
+    return left
+}
+
+// 字段名：标识符或数字下标
+func ps_field_name() -> i64 {
+    if ps_kind(0) == K_IDENT {
+        var nid = ps_qid(0)
+        ps_adv()
+        return nid
+    }
+    if ps_kind(0) == K_INT {
+        var nid2 = em_nameid(ps_text(0))
+        ps_adv()
+        return nid2
+    }
+    ps_err_here("字段访问 '.' 后必须是字段名/方法名/数字下标，实际是 " + ps_kdesc(0))
+    return -1
+}
+
+// 索引尾部：普通表达式 或 范围（含空端点=0）
+func ps_index_tail() -> i64 {
+    var k = ps_kind(0)
+    if k == K_DOTDOT || k == K_DOTDOTEQ {
+        var incl: i64 = 0
+        if k == K_DOTDOTEQ {
+            incl = 1
+        }
+        ps_adv()
+        var hi: i64 = 0
+        if ps_kind(0) != K_RBRACKET {
+            hi = ps_expr()
+            if hi < 0 {
+                return -1
+            }
+        }
+        var n = em_new(T_E_RANGE)
+        em_put(n, 1, 0)
+        em_put(n, 2, hi)
+        em_put(n, 3, incl)
+        return n
+    }
+    return ps_expr()
+}
+
+// 实参：表达式 或 命名实参（name: expr）
+func ps_arg() -> i64 {
+    if ps_kind(0) == K_IDENT && ps_kind(1) == K_COLON {
+        var nid = ps_qid(0)
+        ps_adv()
+        ps_adv()
+        var v = ps_expr()
+        if v < 0 {
+            return -1
+        }
+        var n = em_new(T_A_NARG)
+        em_put(n, 1, nid)
+        em_put(n, 2, v)
+        return n
+    }
+    return ps_expr()
+}
+
+// ---------- 表达式：一元与幂 ----------
+func ps_e_power() -> i64 {
+    var left = ps_e_unary()
+    if left < 0 {
+        return -1
+    }
+    if ps_kind(0) == K_STARSTAR {
+        ps_adv()
+        var r = ps_e_power()                   // 右结合
+        if r < 0 {
+            return -1
+        }
+        var n = em_new(T_E_BIN)
+        em_put(n, 1, K_STARSTAR)
+        em_put(n, 2, left)
+        em_put(n, 3, r)
+        return n
+    }
+    return left
+}
+
+func ps_e_unary() -> i64 {
+    var k = ps_kind(0)
+    if k == K_MINUS || k == K_BANG || k == K_TILDE || k == K_INC || k == K_DEC {
+        ps_adv()
+        var e = ps_e_unary()
+        if e < 0 {
+            return -1
+        }
+        var n = em_new(T_E_UN)
+        em_put(n, 1, k)
+        em_put(n, 2, e)
+        return n
+    }
+    return ps_e_postfix()
+}
+
+// ---------- 表达式：二元层级（低 → 高） ----------
+func ps_bin_new(op: i64, l: i64, r: i64) -> i64 {
+    var n = em_new(T_E_BIN)
+    em_put(n, 1, op)
+    em_put(n, 2, l)
+    em_put(n, 3, r)
+    return n
+}
+
+func ps_e_mul() -> i64 {
+    var left = ps_e_power()
+    if left < 0 {
+        return -1
+    }
+    while true {
+        var k = ps_kind(0)
+        if k == K_STAR || k == K_SLASH || k == K_PERCENT || k == K_BACKSLASH || k == K_PERCENTPERCENT {
+            ps_adv()
+            var r = ps_e_power()
+            if r < 0 {
+                return -1
+            }
+            left = ps_bin_new(k, left, r)
+        } else {
+            break
+        }
+    }
+    return left
+}
+
+func ps_e_add() -> i64 {
+    var left = ps_e_mul()
+    if left < 0 {
+        return -1
+    }
+    while true {
+        var k = ps_kind(0)
+        if k == K_PLUS || k == K_MINUS {
+            ps_adv()
+            var r = ps_e_mul()
+            if r < 0 {
+                return -1
+            }
+            left = ps_bin_new(k, left, r)
+        } else {
+            break
+        }
+    }
+    return left
+}
+
+func ps_e_shift() -> i64 {
+    var left = ps_e_add()
+    if left < 0 {
+        return -1
+    }
+    while true {
+        var k = ps_kind(0)
+        if k == K_SHL || k == K_SHR {
+            ps_adv()
+            var r = ps_e_add()
+            if r < 0 {
+                return -1
+            }
+            left = ps_bin_new(k, left, r)
+        } else {
+            break
+        }
+    }
+    return left
+}
+
+// 比较链折叠：< > <= >= 多段以 && 连接；单段保持二元
+func ps_fold_cmp(items: table<i64>, ops: table<i64>) -> i64 {
+    var m = len(ops)
+    if m == 0 {
+        return items[0]
+    }
+    if m == 1 {
+        return ps_bin_new(ops[0], items[0], items[1])
+    }
+    var segs: table<i64> = []
+    var i: i64 = 0
+    while i < m {
+        table_push(segs, ps_bin_new(ops[i], items[i], items[i + 1]))
+        i = i + 1
+    }
+    var acc = segs[0]
+    i = 1
+    while i < len(segs) {
+        acc = ps_bin_new(K_ANDAND, acc, segs[i])
+        i = i + 1
+    }
+    return acc
+}
+
+func ps_e_rel() -> i64 {
+    var left = ps_e_shift()
+    if left < 0 {
+        return -1
+    }
+    var items: table<i64> = []
+    var ops: table<i64> = []
+    table_push(items, left)
+    while true {
+        var k = ps_kind(0)
+        if k == K_LT || k == K_GT || k == K_LE || k == K_GE {
+            table_push(ops, k)
+            ps_adv()
+            var r = ps_e_shift()
+            if r < 0 {
+                return -1
+            }
+            table_push(items, r)
+        } else if k == KW_IN {
+            // 先结算比较链，再作普通二元
+            left = ps_fold_cmp(items, ops)
+            items = []
+            ops = []
+            table_push(items, left)
+            ps_adv()
+            var r2 = ps_e_shift()
+            if r2 < 0 {
+                return -1
+            }
+            left = ps_bin_new(KW_IN, left, r2)
+            items = []
+            ops = []
+            table_push(items, left)
+        } else if k == K_IDENT && ps_text(0) == "not" && ps_kind(1) == KW_IN {
+            left = ps_fold_cmp(items, ops)
+            items = []
+            ops = []
+            ps_adv()
+            ps_adv()
+            var r3 = ps_e_shift()
+            if r3 < 0 {
+                return -1
+            }
+            left = ps_bin_new(OP_NOT_IN, left, r3)
+            table_push(items, left)
+        } else if k == KW_IS {
+            left = ps_fold_cmp(items, ops)
+            items = []
+            ops = []
+            ps_adv()
+            var t = ps_type()
+            if t < 0 {
+                return -1
+            }
+            var n = em_new(T_E_IS)
+            em_put(n, 1, left)
+            em_put(n, 2, t)
+            left = n
+            table_push(items, left)
+        } else {
+            break
+        }
+    }
+    return ps_fold_cmp(items, ops)
+}
+
+func ps_e_eq() -> i64 {
+    var left = ps_e_rel()
+    if left < 0 {
+        return -1
+    }
+    while true {
+        var k = ps_kind(0)
+        if k == K_EQEQ || k == K_NOTEQ {
+            ps_adv()
+            var r = ps_e_rel()
+            if r < 0 {
+                return -1
+            }
+            left = ps_bin_new(k, left, r)
+        } else {
+            break
+        }
+    }
+    return left
+}
+
+func ps_e_bitand() -> i64 {
+    var left = ps_e_eq()
+    if left < 0 {
+        return -1
+    }
+    while ps_kind(0) == K_AMP {
+        ps_adv()
+        var r = ps_e_eq()
+        if r < 0 {
+            return -1
+        }
+        left = ps_bin_new(K_AMP, left, r)
+    }
+    return left
+}
+
+func ps_e_bitxor() -> i64 {
+    var left = ps_e_bitand()
+    if left < 0 {
+        return -1
+    }
+    while ps_kind(0) == K_CARET {
+        ps_adv()
+        var r = ps_e_bitand()
+        if r < 0 {
+            return -1
+        }
+        left = ps_bin_new(K_CARET, left, r)
+    }
+    return left
+}
+
+func ps_e_bitor() -> i64 {
+    var left = ps_e_bitxor()
+    if left < 0 {
+        return -1
+    }
+    while ps_kind(0) == K_PIPE {
+        ps_adv()
+        var r = ps_e_bitxor()
+        if r < 0 {
+            return -1
+        }
+        left = ps_bin_new(K_PIPE, left, r)
+    }
+    return left
+}
+
+func ps_e_and() -> i64 {
+    var left = ps_e_bitor()
+    if left < 0 {
+        return -1
+    }
+    while ps_kind(0) == K_ANDAND {
+        ps_adv()
+        var r = ps_e_bitor()
+        if r < 0 {
+            return -1
+        }
+        left = ps_bin_new(K_ANDAND, left, r)
+    }
+    return left
+}
+
+func ps_e_or() -> i64 {
+    var left = ps_e_and()
+    if left < 0 {
+        return -1
+    }
+    while ps_kind(0) == K_OROR {
+        ps_adv()
+        var r = ps_e_and()
+        if r < 0 {
+            return -1
+        }
+        left = ps_bin_new(K_OROR, left, r)
+    }
+    return left
+}
+
+// ?: 安全默认值（右结合）
+func ps_e_defval() -> i64 {
+    var left = ps_e_or()
+    if left < 0 {
+        return -1
+    }
+    if ps_kind(0) == K_QCOLON {
+        ps_adv()
+        var r = ps_e_defval()
+        if r < 0 {
+            return -1
+        }
+        var n = em_new(T_E_DEFVAL)
+        em_put(n, 1, left)
+        em_put(n, 2, r)
+        return n
+    }
+    return left
+}
+
+// 管道与反向箭头（左结合）
+func ps_e_pipe() -> i64 {
+    var left = ps_e_defval()
+    if left < 0 {
+        return -1
+    }
+    while true {
+        var k = ps_kind(0)
+        if k == K_ARROW {
+            ps_adv()
+            var n = ps_pipe_rhs(left)
+            if n < 0 {
+                return -1
+            }
+            left = n
+        } else if k == K_LARROW {
+            ps_adv()
+            var r = ps_e_defval()
+            if r < 0 {
+                return -1
+            }
+            var tg = em_tag(left)
+            if tg == T_E_TUPLE {
+                // 解构赋值
+                var d = em_new(T_E_DECON)
+                em_put(d, 1, em_get(left, 1))
+                em_put(d, 2, em_get(left, 2))
+                em_put(d, 3, r)
+                left = d
+            } else if tg == T_E_IDENT || tg == T_E_FIELD || tg == T_E_INDEX {
+                var ap = em_new(T_E_APPEND)
+                em_put(ap, 1, left)
+                em_put(ap, 2, r)
+                left = ap
+            } else {
+                ps_err_here("赋值目标必须是变量或对象字段")
+                return -1
+            }
+        } else {
+            break
+        }
+    }
+    return left
+}
+
+// 管道右端：运算符 / 名字（含后缀）/ 索引 / 字段
+func ps_pipe_rhs(left: i64) -> i64 {
+    var k = ps_kind(0)
+    // 运算符形态：left OP rhs
+    if k == K_PLUS || k == K_MINUS || k == K_STAR || k == K_SLASH || k == K_PERCENT ||
+        k == K_STARSTAR || k == K_BACKSLASH || k == K_PERCENTPERCENT ||
+        k == K_EQEQ || k == K_NOTEQ || k == K_LT || k == K_GT || k == K_LE || k == K_GE ||
+        k == K_ANDAND || k == K_OROR || k == K_AMP || k == K_PIPE || k == K_CARET ||
+        k == K_SHL || k == K_SHR || k == KW_IN {
+        ps_adv()
+        var r = ps_e_unary()
+        if r < 0 {
+            return -1
+        }
+        return ps_bin_new(k, left, r)
+    }
+    // 索引形态：t -> [i]
+    if k == K_LBRACKET {
+        ps_adv()
+        var idx = ps_index_tail()
+        if idx < 0 {
+            return -1
+        }
+        if !ps_expect(K_RBRACKET, "]") {
+            return -1
+        }
+        var ix = em_new(T_E_INDEX)
+        em_put(ix, 1, left)
+        em_put(ix, 2, idx)
+        return ix
+    }
+    // 字段形态：t -> .f
+    if k == K_DOT {
+        ps_adv()
+        var fname = ps_field_name()
+        if fname < 0 {
+            return -1
+        }
+        var fl = em_new(T_E_FIELD)
+        em_put(fl, 1, left)
+        em_put(fl, 2, fname)
+        return fl
+    }
+    // 名字形态：x -> f(1) 等（名字 + 后缀链）
+    if k == K_IDENT {
+        var rhs = ps_e_defval()
+        if rhs < 0 {
+            return -1
+        }
+        var p = em_new(T_E_PIPE)
+        em_put(p, 1, left)
+        em_put(p, 2, rhs)
+        return p
+    }
+    ps_err_here("无法以 " + ps_kdesc(0) + " 开始表达式")
+    return -1
+}
+
+// 对已解析的主元继续吃后缀（供管道右端复用）
+func ps_postfix_tail(base: i64) -> i64 {
+    var left = base
+    while true {
+        var k = ps_kind(0)
+        if k == K_LPAREN {
+            ps_adv()
+            var args: table<i64> = []
+            if ps_kind(0) != K_RPAREN {
+                while true {
+                    var a = ps_arg()
+                    if a < 0 {
+                        return -1
+                    }
+                    table_push(args, a)
+                    if ps_kind(0) == K_COMMA {
+                        ps_adv()
+                        continue
+                    }
+                    break
+                }
+            }
+            if !ps_expect(K_RPAREN, "(") {
+                return -1
+            }
+            var c = em_new(T_E_CALL)
+            em_put(c, 1, left)
+            ps_set_seg(c, 2, args)
+            left = c
+        } else if k == K_LBRACKET {
+            ps_adv()
+            var idx = ps_index_tail()
+            if idx < 0 {
+                return -1
+            }
+            if !ps_expect(K_RBRACKET, "]") {
+                return -1
+            }
+            var ix = em_new(T_E_INDEX)
+            em_put(ix, 1, left)
+            em_put(ix, 2, idx)
+            left = ix
+        } else if k == K_DOT {
+            ps_adv()
+            var fname = ps_field_name()
+            if fname < 0 {
+                return -1
+            }
+            var fl = em_new(T_E_FIELD)
+            em_put(fl, 1, left)
+            em_put(fl, 2, fname)
+            left = fl
+        } else {
+            break
+        }
+    }
+    return left
+}
+
+// 表达式入口（含范围，最低优先级）
+func ps_expr() -> i64 {
+    var left = ps_e_pipe()
+    if left < 0 {
+        return -1
+    }
+    var k = ps_kind(0)
+    if k == K_DOTDOT || k == K_DOTDOTEQ {
+        var incl: i64 = 0
+        if k == K_DOTDOTEQ {
+            incl = 1
+        }
+        ps_adv()
+        var hi: i64 = 0
+        var k2 = ps_kind(0)
+        if k2 != K_RBRACKET && k2 != K_RPAREN && k2 != K_COMMA && k2 != K_LBRACE && k2 != K_SEMI && k2 != K_EOF {
+            hi = ps_e_pipe()
+            if hi < 0 {
+                return -1
+            }
+        }
+        var n = em_new(T_E_RANGE)
+        em_put(n, 1, left)
+        em_put(n, 2, hi)
+        em_put(n, 3, incl)
+        return n
+    }
+    return left
+}
+
+// ---------- 参数（供函数/闭包/变体复用） ----------
+func ps_param() -> i64 {
+    // 约定修饰：ref / immut
+    var conv: i64 = 0
+    if ps_kind(0) == KW_REF {
+        conv = 1
+        ps_adv()
+    } else if ps_kind(0) == KW_IMMUT {
+        conv = 2
+        ps_adv()
+    }
+    var name = ps_expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var ty: i64 = 0
+    var is_var: i64 = 0
+    if ps_kind(0) == K_COLON {
+        ps_adv()
+        if ps_kind(0) == K_ELLIPSIS {
+            is_var = 1
+            ps_adv()
+        }
+        ty = ps_type()
+        if ty < 0 {
+            return -1
+        }
+    }
+    if is_var == 1 {
+        if conv == 1 {
+            ps_err_here("变参参数不能同时使用 ref 修饰")
+            return -1
+        }
+        if conv == 2 {
+            ps_err_here("变参参数不能同时使用 immut 修饰")
+            return -1
+        }
+        conv = 3
+    }
+    var dflt: i64 = 0
+    if ps_kind(0) == K_EQ {
+        if conv == 3 {
+            ps_err_here("变参参数不能有默认值")
+            return -1
+        }
+        ps_adv()
+        dflt = ps_expr()
+        if dflt < 0 {
+            return -1
+        }
+    }
+    var n = em_new(T_A_PARAM)
+    em_put(n, 1, name)
+    em_put(n, 2, ty)
+    em_put(n, 3, conv)
+    em_put(n, 4, dflt)
+    return n
+}
+
+// 参数列表（不含括号）；返回列表（局部表）
+func ps_params(ref lst: table<i64>) -> bool {
+    if ps_kind(0) == K_RPAREN {
+        return true
+    }
+    while true {
+        var p = ps_param()
+        if p < 0 {
+            return false
+        }
+        table_push(lst, p)
+        if ps_kind(0) == K_COMMA {
+            ps_adv()
+            continue
+        }
+        break
+    }
+    return true
+}
+
+// ---------- 块与语句 ----------
+func ps_block() -> i64 {
+    if !ps_expect(K_LBRACE, "{") {
+        return -1
+    }
+    var kids: table<i64> = []
+    while true {
+        while ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+        var k = ps_kind(0)
+        if k == K_RBRACE || k == K_EOF {
+            break
+        }
+        var s = ps_stmt()
+        if s < 0 {
+            return -1
+        }
+        table_push(kids, s)
+        if ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+    }
+    if !ps_expect(K_RBRACE, "}") {
+        return -1
+    }
+    var n = em_new(T_S_BLOCK)
+    ps_set_seg(n, 1, kids)
+    return n
+}
+
+// 解构绑定列表（`(` 已消费）
+func ps_binds_paren(ref lst: table<i64>) -> bool {
+    var seen_rest = 0
+    while true {
+        if ps_kind(0) == K_RPAREN {
+            break
+        }
+        if ps_kind(0) == K_ELLIPSIS {
+            if seen_rest != 0 {
+                ps_err_here("剩余解构 '...rest' 只能出现一次")
+                return false
+            }
+            seen_rest = 1
+            ps_adv()
+            var rn = ps_expect_ident()
+            if rn < 0 {
+                return false
+            }
+            var rb = em_new(T_A_BIND)
+            em_put(rb, 1, rn)
+            em_put(rb, 2, PS_B_REST)
+            table_push(lst, rb)
+            if ps_kind(0) == K_COMMA {
+                ps_adv()
+                continue
+            }
+            break
+        }
+        var nid = ps_expect_ident()
+        if nid < 0 {
+            return false
+        }
+        var b = em_new(T_A_BIND)
+        em_put(b, 1, nid)
+        table_push(lst, b)
+        if ps_kind(0) == K_COMMA {
+            ps_adv()
+            continue
+        }
+        break
+    }
+    return true
+}
+
+// var / const 声明（含解构）
+func ps_var_stmt(is_global: i64, is_pub: i64) -> i64 {
+    var is_const: i64 = 0
+    if ps_kind(0) == KW_CONST {
+        is_const = 1
+    }
+    ps_adv()
+    var binds: table<i64> = table_new_i64()
+    if ps_kind(0) == K_LPAREN {
+        ps_adv()
+        if ps_kind(0) == K_RPAREN {
+            ps_err_here("空解构 () 不支持")
+            return -1
+        }
+        if !ps_binds_paren(binds) {
+            return -1
+        }
+        if !ps_expect(K_RPAREN, "(") {
+            return -1
+        }
+    } else {
+        var nid = ps_expect_ident()
+        if nid < 0 {
+            return -1
+        }
+        var b = em_new(T_A_BIND)
+        em_put(b, 1, nid)
+        table_push(binds, b)
+    }
+    var ty: i64 = 0
+    if ps_kind(0) == K_COLON {
+        ps_adv()
+        ty = ps_type()
+        if ty < 0 {
+            return -1
+        }
+    }
+    var init: i64 = 0
+    if ps_kind(0) == K_EQ {
+        ps_adv()
+        init = ps_expr()
+        if init < 0 {
+            return -1
+        }
+    }
+    var flags: i64 = 0
+    if is_const == 1 {
+        flags = flags | 1
+    }
+    if is_global == 1 {
+        flags = flags | 2
+    }
+    if is_pub == 1 {
+        flags = flags | 4
+    }
+    var n = em_new(T_D_VAR)
+    em_put(n, 3, ty)
+    em_put(n, 4, init)
+    em_put(n, 5, flags)
+    ps_set_seg(n, 1, binds)
+    return n
+}
+
+func ps_if_stmt() -> i64 {
+    ps_adv()                                   // if
+    var cond = ps_expr()
+    if cond < 0 {
+        return -1
+    }
+    var then_b = ps_block()
+    if then_b < 0 {
+        return -1
+    }
+    var else_b: i64 = 0
+    if ps_kind(0) == KW_ELSE {
+        ps_adv()
+        if ps_kind(0) == KW_IF {
+            else_b = ps_if_stmt()
+        } else {
+            else_b = ps_block()
+        }
+        if else_b < 0 {
+            return -1
+        }
+    }
+    var n = em_new(T_S_IF)
+    em_put(n, 1, cond)
+    em_put(n, 2, then_b)
+    em_put(n, 3, else_b)
+    return n
+}
+
+func ps_while_stmt(lbl: i64) -> i64 {
+    ps_adv()                                   // while
+    var cond = ps_expr()
+    if cond < 0 {
+        return -1
+    }
+    var body = ps_block()
+    if body < 0 {
+        return -1
+    }
+    var n = em_new(T_S_WHILE)
+    em_put(n, 1, cond)
+    em_put(n, 2, body)
+    return n
+}
+
+func ps_for_stmt(lbl: i64) -> i64 {
+    ps_adv()                                   // for
+    var binds: table<i64> = table_new_i64()
+    if ps_kind(0) == K_LPAREN {
+        ps_adv()
+        if ps_kind(0) == K_RPAREN {
+            ps_err_here("空解构 () 不支持")
+            return -1
+        }
+        if !ps_binds_paren(binds) {
+            return -1
+        }
+        if !ps_expect(K_RPAREN, "(") {
+            return -1
+        }
+    } else {
+        var nid = ps_expect_ident()
+        if nid < 0 {
+            return -1
+        }
+        var b = em_new(T_A_BIND)
+        em_put(b, 1, nid)
+        table_push(binds, b)
+    }
+    if !ps_expect(KW_IN, "in") {
+        return -1
+    }
+    var src = ps_expr()
+    if src < 0 {
+        return -1
+    }
+    var body = ps_block()
+    if body < 0 {
+        return -1
+    }
+    if em_tag(src) == T_E_RANGE {
+        var n = em_new(T_S_FORRANGE)
+        em_put(n, 2, em_get(src, 1))           // lo
+        em_put(n, 3, em_get(src, 2))           // hi
+        em_put(n, 4, em_get(src, 3))           // incl
+        em_put(n, 5, body)
+        em_put(n, 6, lbl)
+        ps_set_seg(n, 1, binds)
+        return n
+    }
+    var n2 = em_new(T_S_FORIN)
+    em_put(n2, 3, src)
+    em_put(n2, 4, body)
+    em_put(n2, 5, lbl)
+    ps_set_seg(n2, 1, binds)
+    return n2
+}
+
+// switch 语句体：语句序列直到 case/default/}（S_BLOCK 包装）
+func ps_case_body() -> i64 {
+    var kids: table<i64> = []
+    while true {
+        var k = ps_kind(0)
+        if k == KW_CASE || k == KW_DEFAULT || k == K_RBRACE || k == K_EOF {
+            break
+        }
+        while ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+        k = ps_kind(0)
+        if k == KW_CASE || k == KW_DEFAULT || k == K_RBRACE || k == K_EOF {
+            break
+        }
+        var s = ps_stmt()
+        if s < 0 {
+            return -1
+        }
+        table_push(kids, s)
+        if ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+    }
+    var n = em_new(T_S_BLOCK)
+    ps_set_seg(n, 1, kids)
+    return n
+}
+
+func ps_switch_stmt() -> i64 {
+    ps_adv()                                   // switch
+    var obj = ps_expr()
+    if obj < 0 {
+        return -1
+    }
+    if !ps_expect(K_LBRACE, "{") {
+        return -1
+    }
+    var cases: table<i64> = []
+    while true {
+        var k = ps_kind(0)
+        if k == K_RBRACE {
+            ps_adv()
+            break
+        }
+        if k == K_COLON {
+            ps_adv()
+            continue
+        }
+        if k == KW_CASE {
+            ps_adv()
+            var pats: table<i64> = []
+            while true {
+                var p = ps_pattern()
+                if p < 0 {
+                    return -1
+                }
+                table_push(pats, p)
+                if ps_kind(0) == K_COMMA {
+                    ps_adv()
+                    continue
+                }
+                break
+            }
+            if !ps_expect(K_COLON, ":") {
+                return -1
+            }
+            var body = ps_case_body()
+            if body < 0 {
+                return -1
+            }
+            var c = em_new(T_A_CASE)
+            em_put(c, 3, body)
+            ps_set_seg(c, 1, pats)
+            table_push(cases, c)
+        } else if k == KW_DEFAULT {
+            ps_adv()
+            if !ps_expect(K_COLON, ":") {
+                return -1
+            }
+            var body2 = ps_case_body()
+            if body2 < 0 {
+                return -1
+            }
+            var c2 = em_new(T_A_CASE)
+            em_put(c2, 3, body2)
+            var empty: table<i64> = []
+            ps_set_seg(c2, 1, empty)
+            table_push(cases, c2)
+        } else {
+            ps_err_here("switch 体内只允许 case/default/右花括号，实际是 " + ps_kdesc(0))
+            return -1
+        }
+        if ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+    }
+    var n = em_new(T_S_SWITCH)
+    em_put(n, 1, obj)
+    ps_set_seg(n, 2, cases)
+    return n
+}
+
+func ps_stmt() -> i64 {
+    var lbl: i64 = 0
+    // 标签预检：IDENT ':' (while|for)
+    if ps_kind(0) == K_IDENT && ps_kind(1) == K_COLON {
+        var k2 = ps_kind(2)
+        if k2 == KW_WHILE || k2 == KW_FOR {
+            lbl = ps_qid(0)
+            ps_adv()
+            ps_adv()
+        } else {
+            var lname = ps_text(0)
+            em_fail(ps_line(0), ps_col(0), "标签 '" + lname + "' 只能用于 while 或 for")
+            return -1
+        }
+    }
+    var k = ps_kind(0)
+    if k == KW_VAR || k == KW_CONST {
+        return ps_var_stmt(0, 0)
+    }
+    if k == KW_IF {
+        return ps_if_stmt()
+    }
+    if k == KW_WHILE {
+        return ps_while_stmt(lbl)
+    }
+    if k == KW_FOR {
+        return ps_for_stmt(lbl)
+    }
+    if k == KW_SWITCH {
+        return ps_switch_stmt()
+    }
+    if k == KW_RETURN {
+        ps_adv()
+        var k2 = ps_kind(0)
+        if k2 == K_SEMI || k2 == K_RBRACE || k2 == K_EOF {
+            var n = em_new(T_S_RETURN)
+            return n
+        }
+        var e = ps_expr()
+        if e < 0 {
+            return -1
+        }
+        var n2 = em_new(T_S_RETURN)
+        em_put(n2, 1, e)
+        return n2
+    }
+    if k == KW_BREAK || k == KW_CONTINUE {
+        var bline = ps_line(0)
+        ps_adv()
+        var blbl: i64 = 0
+        if ps_kind(0) == K_IDENT && ps_line(0) == bline {
+            blbl = ps_qid(0)
+            ps_adv()
+        }
+        if k == KW_BREAK {
+            var n3 = em_new(T_S_BREAK)
+            em_put(n3, 1, blbl)
+            return n3
+        }
+        var n4 = em_new(T_S_CONTINUE)
+        em_put(n4, 1, blbl)
+        return n4
+    }
+    if k == KW_PANIC {
+        ps_adv()
+        if !ps_expect(K_LPAREN, "(") {
+            return -1
+        }
+        var pe = ps_expr()
+        if pe < 0 {
+            return -1
+        }
+        if !ps_expect(K_RPAREN, "(") {
+            return -1
+        }
+        var n5 = em_new(T_S_PANIC)
+        em_put(n5, 1, pe)
+        return n5
+    }
+    if k == K_LBRACE {
+        ps_err_here("函数体内不能有裸代码块")
+        return -1
+    }
+    // 表达式语句 / 赋值
+    var e2 = ps_expr()
+    if e2 < 0 {
+        return -1
+    }
+    var k3 = ps_kind(0)
+    if k3 == K_EQ || k3 == K_PLUSEQ || k3 == K_MINUSEQ || k3 == K_STAREQ ||
+        k3 == K_SLASHEQ || k3 == K_PERCENTEQ || k3 == K_PERCENTPPEQ ||
+        k3 == K_BACKSLASHEQ || k3 == K_AMPEQ || k3 == K_PIPEEQ || k3 == K_CARETEQ ||
+        k3 == K_SHLEQ || k3 == K_SHREQ {
+        var oline = ps_line(0)
+        var ocol = ps_col(0)
+        ps_adv()
+        var rhs = ps_expr()
+        if rhs < 0 {
+            return -1
+        }
+        var tg = em_tag(e2)
+        if tg != T_E_IDENT && tg != T_E_FIELD && tg != T_E_INDEX {
+            em_fail(oline, ocol, "赋值目标必须是变量或对象字段")
+            return -1
+        }
+        var a = em_new(T_E_ASSIGN)
+        em_put(a, 1, k3)
+        em_put(a, 2, e2)
+        em_put(a, 3, rhs)
+        return a
+    }
+    var s = em_new(T_S_EXPR)
+    em_put(s, 1, e2)
+    return s
+}
+
+// ---------- 声明 ----------
+func ps_func_decl(is_pub: i64) -> i64 {
+    ps_adv()                                   // func
+    var name = ps_expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !ps_expect(K_LPAREN, "(") {
+        return -1
+    }
+    var sig: table<i64> = table_new_i64()
+    table_push(sig, 0)                         // 返回类型占位
+    if !ps_params(sig) {
+        return -1
+    }
+    if !ps_expect(K_RPAREN, "(") {
+        return -1
+    }
+    if ps_kind(0) == K_ARROW {
+        ps_adv()
+        var ret = ps_type()
+        if ret < 0 {
+            return -1
+        }
+        sig[0] = ret
+    }
+    var body: i64 = 0
+    if ps_kind(0) == K_LBRACE {
+        body = ps_block()
+    } else if ps_kind(0) == K_EQ {
+        ps_adv()
+        body = ps_expr()
+    } else {
+        ps_err_here("期望函数体（{ 或 =），实际是 " + ps_kdesc(0))
+        return -1
+    }
+    if body < 0 {
+        return -1
+    }
+    var n = em_new(T_D_FUNC)
+    em_put(n, 1, name)
+    em_put(n, 4, body)
+    var flags: i64 = 0
+    if is_pub == 1 {
+        flags = flags | 1
+    }
+    em_put(n, 5, flags)
+    ps_set_seg(n, 2, sig)
+    return n
+}
+
+func ps_enum_decl(is_pub: i64) -> i64 {
+    ps_adv()                                   // enum
+    var name = ps_expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !ps_expect(K_LBRACE, "{") {
+        return -1
+    }
+    var variants: table<i64> = []
+    while true {
+        while ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+        if ps_kind(0) == K_RBRACE {
+            ps_adv()
+            break
+        }
+        if ps_kind(0) == K_EOF {
+            ps_err_here("期望标识符，实际是 " + ps_kdesc(0))
+            return -1
+        }
+        var vname = ps_expect_ident()
+        if vname < 0 {
+            return -1
+        }
+        var payload: table<i64> = table_new_i64()
+        if ps_kind(0) == K_LPAREN {
+            ps_adv()
+            if !ps_params(payload) {
+                return -1
+            }
+            if !ps_expect(K_RPAREN, "(") {
+                return -1
+            }
+        }
+        var vn = em_new(T_A_VARIANT)
+        em_put(vn, 1, vname)
+        ps_set_seg(vn, 2, payload)
+        table_push(variants, vn)
+        if ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+    }
+    var n = em_new(T_D_ENUM)
+    em_put(n, 1, name)
+    var flags: i64 = 0
+    if is_pub == 1 {
+        flags = flags | 1
+    }
+    em_put(n, 4, flags)
+    ps_set_seg(n, 2, variants)
+    return n
+}
+
+func ps_namespace_decl(is_pub: i64) -> i64 {
+    ps_adv()                                   // namespace
+    var name = ps_expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var body = ps_decl_block()
+    if body < 0 {
+        return -1
+    }
+    var n = em_new(T_D_NAMESPACE)
+    em_put(n, 1, name)
+    em_put(n, 2, body)
+    return n
+}
+
+func ps_alias_decl(is_pub: i64) -> i64 {
+    ps_adv()                                   // alias
+    var name = ps_expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !ps_expect(K_EQ, "=") {
+        return -1
+    }
+    var ty = ps_type()
+    if ty < 0 {
+        return -1
+    }
+    var n = em_new(T_D_ALIAS)
+    em_put(n, 1, name)
+    em_put(n, 2, ty)
+    return n
+}
+
+func ps_import_decl(is_pub: i64) -> i64 {
+    ps_adv()                                   // import
+    if ps_kind(0) != K_STR {
+        ps_err_here("import 后必须是字符串路径，实际是 " + ps_kdesc(0))
+        return -1
+    }
+    var off = ps_off_of(0) + 1                // 去引号（普通串）
+    var ln = ps_len_of(0) - 2
+    ps_adv()
+    var als: i64 = 0
+    if ps_kind(0) == KW_AS {
+        ps_adv()
+        if ps_kind(0) != K_IDENT {
+            ps_err_here("as 后必须是别名标识符，实际是 " + ps_kdesc(0))
+            return -1
+        }
+        als = ps_qid(0)
+        ps_adv()
+    }
+    var n = em_new(T_D_IMPORT)
+    em_put(n, 1, off)
+    em_put(n, 2, ln)
+    em_put(n, 3, als)
+    return n
+}
+
+func ps_using_decl(is_pub: i64) -> i64 {
+    ps_adv()                                   // using
+    var names: table<i64> = []
+    var nid = ps_expect_ident()
+    if nid < 0 {
+        return -1
+    }
+    table_push(names, nid)
+    while ps_kind(0) == K_DOT {
+        ps_adv()
+        var nid2 = ps_expect_ident()
+        if nid2 < 0 {
+            return -1
+        }
+        table_push(names, nid2)
+    }
+    var n = em_new(T_D_USING)
+    ps_set_seg(n, 1, names)
+    return n
+}
+
+// ---------- 顶层 ----------
+func ps_top_item() -> i64 {
+    var k = ps_kind(0)
+    if k == KW_PUB {
+        ps_adv()
+        var k2 = ps_kind(0)
+        if k2 == KW_FUNC {
+            return ps_func_decl(1)
+        }
+        if k2 == KW_VAR || k2 == KW_CONST {
+            return ps_var_stmt(1, 1)
+        }
+        if k2 == KW_ENUM {
+            return ps_enum_decl(1)
+        }
+        ps_err_here("期望 func/var/const/enum，实际是 " + ps_kdesc(0))
+        return -1
+    }
+    if k == KW_FUNC {
+        return ps_func_decl(0)
+    }
+    if k == KW_ENUM {
+        return ps_enum_decl(0)
+    }
+    if k == KW_NAMESPACE {
+        return ps_namespace_decl(0)
+    }
+    if k == KW_ALIAS {
+        return ps_alias_decl(0)
+    }
+    if k == KW_IMPORT {
+        return ps_import_decl(0)
+    }
+    if k == KW_USING {
+        return ps_using_decl(0)
+    }
+    if k == KW_VAR || k == KW_CONST {
+        return ps_var_stmt(1, 0)
+    }
+    // 脚本：普通语句
+    var s = ps_stmt()
+    return s
+}
+
+// 声明块（namespace 体）：允许顶层声明与语句（宽容），直至 '}'
+func ps_decl_block() -> i64 {
+    if !ps_expect(K_LBRACE, "{") {
+        return -1
+    }
+    var kids: table<i64> = []
+    while true {
+        while ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+        if ps_kind(0) == K_RBRACE || ps_kind(0) == K_EOF {
+            break
+        }
+        var item = ps_top_item()
+        if item < 0 {
+            return -1
+        }
+        table_push(kids, item)
+        if ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+    }
+    if !ps_expect(K_RBRACE, "}") {
+        return -1
+    }
+    var n = em_new(T_S_BLOCK)
+    ps_set_seg(n, 1, kids)
+    return n
+}
+
+// ---------- 入口 ----------
+pub func ps_parse(src: string) -> i64 {
+    em_reset()
+    ps_dead = false
+    pq_clear()
+    var body = ps_strip_header(src)
+    lx_start(body)
+    var st: table<i64> = []
+    while true {
+        while ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+        if ps_kind(0) == K_EOF {
+            break
+        }
+        var item = ps_top_item()
+        if item < 0 {
+            return -1
+        }
+        table_push(st, item)
+        if ps_kind(0) == K_SEMI {
+            ps_adv()
+        }
+    }
+    var root = em_new(T_S_BLOCK)
+    ps_set_seg(root, 1, st)
+    return root
+}
