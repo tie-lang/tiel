@@ -1297,11 +1297,39 @@ func ps_bin(min_prec: i64) -> i64 {
 }
 
 // 比较段（< > <= >= 链折叠 + in / not in / is 特殊形态）；操作数 = 移位级（ps_bin(10)）。
+// 单比较（后随非比较级词元）走免 items/ops 分配的快路径；链 / in / is 进 ps_rel_chain。
 // 比较链以 && 连接在 ps_fold_cmp。
 func ps_rel_seg(left: i64) -> i64 {
+    var k = ps_kind(0)
+    if k == K_LT || k == K_GT || k == K_LE || k == K_GE {
+        ps_adv()
+        var r = ps_bin(10)
+        if r < 0 {
+            return -1
+        }
+        var k2 = ps_kind(0)
+        if k2 == K_LT || k2 == K_GT || k2 == K_LE || k2 == K_GE || k2 == KW_IN || k2 == KW_IS ||
+            (k2 == K_IDENT && ps_span_eq(0, "not") && ps_kind(1) == KW_IN) {
+            var items0: table<i64> = []
+            var ops0: table<i64> = []
+            table_push(items0, left)
+            table_push(items0, r)
+            table_push(ops0, k)
+            return ps_rel_chain(left, items0, ops0)
+        }
+        return ps_bin_new(k, left, r)
+    }
     var items: table<i64> = []
     var ops: table<i64> = []
     table_push(items, left)
+    return ps_rel_chain(left, items, ops)
+}
+
+// 比较链慢路径（含 in / not in / is；items/ops 就地复用，不复分配）
+func ps_rel_chain(left0: i64, items0: table<i64>, ops0: table<i64>) -> i64 {
+    var left = left0
+    var items = items0
+    var ops = ops0
     while true {
         var k = ps_kind(0)
         if k == K_LT || k == K_GT || k == K_LE || k == K_GE {
@@ -1315,8 +1343,8 @@ func ps_rel_seg(left: i64) -> i64 {
         } else if k == KW_IN {
             // 先结算比较链，再作普通二元
             left = ps_fold_cmp(items, ops)
-            items = []
-            ops = []
+            table_trunc(items, 0)
+            table_trunc(ops, 0)
             table_push(items, left)
             ps_adv()
             var r2 = ps_bin(10)
@@ -1324,13 +1352,13 @@ func ps_rel_seg(left: i64) -> i64 {
                 return -1
             }
             left = ps_bin_new(KW_IN, left, r2)
-            items = []
-            ops = []
+            table_trunc(items, 0)
+            table_trunc(ops, 0)
             table_push(items, left)
         } else if k == K_IDENT && ps_span_eq(0, "not") && ps_kind(1) == KW_IN {
             left = ps_fold_cmp(items, ops)
-            items = []
-            ops = []
+            table_trunc(items, 0)
+            table_trunc(ops, 0)
             ps_adv()
             ps_adv()
             var r3 = ps_bin(10)
@@ -1341,8 +1369,8 @@ func ps_rel_seg(left: i64) -> i64 {
             table_push(items, left)
         } else if k == KW_IS {
             left = ps_fold_cmp(items, ops)
-            items = []
-            ops = []
+            table_trunc(items, 0)
+            table_trunc(ops, 0)
             ps_adv()
             var t = ps_type()
             if t < 0 {
