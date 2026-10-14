@@ -1,11 +1,11 @@
 type tie<class>
-// emcodes.tie —— triel 错误码表（E 码查询；tie Error Code）
+// emcodes.tie —— tiel 错误码表（E 码查询；tie Error Code）
 // ============================================================
 // 职责：把前端错误消息映射为 E 码，供 error[E#####] 形态呈现（见 render.tie）。
 //   * ec_norm：归一化——ASCII 0x20..0x7E 连续运行折叠为单个 '%'
 //     （与 tiec diagcode 的归一化一致；空格在内）；
 //   * ec_lookup：exact（等值）→ prefix（最长前缀）→ E00000 兜底。
-// 表内容 = triel 报错点消息闭包内的全部命中条目（exact + prefix 两层）；
+// 表内容 = tiel 报错点消息闭包内的全部命中条目（exact + prefix 两层）；
 //   超出闭包的消息走 E00000（与 tiec 的未分类兜底语义一致）。
 // 数据由 tiec 的 diagcode 目录全量采证生成（对 248 条代表消息回放验证一致）；
 // 重采：按仓库工作区的采集工具链重跑并重新生成本文件。
