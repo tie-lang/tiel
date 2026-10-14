@@ -33,12 +33,12 @@ pub const T_E_MAP: i64 = 16;       // 条目区段(2)（键值交替）
 pub const T_E_TUPLE: i64 = 17;     // 元素区段(2)
 pub const T_E_RANGE: i64 = 18;     // lo + hi + incl
 pub const T_E_SLICE: i64 = 19;     // obj + lo + hi
-pub const T_E_CLOSURE: i64 = 20;   // 参数区段(2) + body
+pub const T_E_CLOSURE: i64 = 20;   // 签名区段(2)（首元素=ret） + body
 pub const T_E_IFEXPR: i64 = 21;    // cond + then + else
 pub const T_E_SWITCHEXPR: i64 = 22;// obj + 分支区段(2)
 pub const T_E_PIPE: i64 = 23;      // l + r
 pub const T_E_IS: i64 = 24;        // e + 类型
-pub const T_E_COMP: i64 = 25;      // expr + 绑定区段(2) + src + cond
+pub const T_E_COMP: i64 = 25;      // name + src + cond + body（综合；多层 for 用嵌套）
 pub const T_E_TRYPOP: i64 = 26;    // e
 pub const T_E_DEFVAL: i64 = 27;    // e + d
 pub const T_E_OPTCHAIN: i64 = 28;  // e + 名/下标
@@ -67,7 +67,8 @@ pub const T_D_ENUM: i64 = 61;      // name + 变体区段(2)
 pub const T_D_NAMESPACE: i64 = 62; // name + body
 pub const T_D_ALIAS: i64 = 63;     // name + 类型
 pub const T_D_IMPORT: i64 = 64;    // 路径区段(2) + 别名名
-pub const T_D_VAR: i64 = 65;       // name + 类型 + init + flags（var/const/全局/局部/pub）
+pub const T_D_VAR: i64 = 65;       // bind 区段(2) + 类型 + init + flags（var/const/全局/局部/pub）
+pub const T_D_USING: i64 = 67;     // 名字链区段(2)（using 引入）
 
 // ---------- tag 常量：类型与辅助 ----------
 pub const T_T_NAME: i64 = 80;      // 名 id
@@ -79,8 +80,12 @@ pub const T_A_PARAM: i64 = 90;     // name + 类型 + 约定标记 + default
 pub const T_A_VARIANT: i64 = 91;   // name + 载荷区段(2)
 pub const T_A_PATTERN: i64 = 92;   // 变体名 + 绑定区段(2)
 pub const T_A_CASE: i64 = 93;      // 模式区段(2) + body
-pub const T_A_BIND: i64 = 94;      // name + flags
+pub const T_A_BIND: i64 = 94;      // name + flags（绑定；rest 位）
 pub const T_A_STRSEG: i64 = 95;    // kind + 内容（区段或表达式）
+pub const T_A_NARG: i64 = 96;      // name + value（命名实参）
+
+// 合成运算符（表示层 op 编号；与词法 kind 不冲突）
+pub const OP_NOT_IN: i64 = 210;    // "not in" 组合
 
 // ---------- 会话状态 ----------
 pub var em_pool: table<i64> = [];       // 节点槽池
@@ -102,6 +107,9 @@ pub func em_tsz(tag: i64) -> i64 {
         return 8
     }
     if tag == T_D_FUNC {
+        return 6
+    }
+    if tag == T_D_ENUM {
         return 6
     }
     if tag == T_D_VAR {
@@ -360,13 +368,13 @@ func em_tag_ok(tg: i64) -> bool {
     if tg >= 40 && tg <= 51 {
         return true
     }
-    if tg >= 60 && tg <= 65 {
+    if tg >= 60 && tg <= 67 {
         return true
     }
     if tg >= 80 && tg <= 83 {
         return true
     }
-    if tg >= 90 && tg <= 95 {
+    if tg >= 90 && tg <= 96 {
         return true
     }
     return false
