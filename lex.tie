@@ -718,25 +718,25 @@ func lx_scan_char() -> i64 {
     var sc = lx_cur_col
     lx_adv1()                                   // 开单引号
     if lx_pos >= lx_n {
-        em_fail(sl, sc, "字符字面量未闭合")
+        em_fail_lex(sl, sc, "字符字面量未闭合")
         return -1
     }
     var b = lx_byte(lx_pos)
     if b == 10 {
-        em_fail(sl, sc, "字符字面量未闭合")
+        em_fail_lex(sl, sc, "字符字面量未闭合")
         return -1
     }
     if b == 92 {                                // 转义字符
         lx_adv1()
         if lx_pos >= lx_n {
-            em_fail(sl, sc, "转义符后缺少字符")
+            em_fail_lex(sl, sc, "转义符后缺少字符")
             return -1
         }
         var e = lx_byte(lx_pos)
         if e == 110 || e == 116 || e == 114 || e == 92 || e == 34 || e == 39 || e == 48 {
             lx_adv1()
         } else {
-            em_fail(sl, sc, "未知转义序列 \\" + str_from_code(e))
+            em_fail_lex(sl, sc, "未知转义序列 \\" + str_from_code(e))
             return -1
         }
     } else {
@@ -752,11 +752,11 @@ func lx_scan_char() -> i64 {
         }
     }
     if lx_pos >= lx_n {
-        em_fail(sl, sc, "字符字面量未闭合")
+        em_fail_lex(sl, sc, "字符字面量未闭合")
         return -1
     }
     if lx_byte(lx_pos) != 39 {
-        em_fail(sl, sc, "字符字面量只能包含一个字符")
+        em_fail_lex(sl, sc, "字符字面量只能包含一个字符")
         return -1
     }
     lx_adv1()                                   // 闭单引号
@@ -939,7 +939,7 @@ func lx_scan_symbol() -> i64 {
             return 1
         }
         if lx_peek(1) == 62 {                   // '=>' 已移除
-            em_fail(sl, sc, "`=>` 已移除，请用 `->`")
+            em_fail_lex(sl, sc, "`=>` 已移除，请用 `->`")
             return -1
         }
         lx_adv1()
@@ -1078,7 +1078,7 @@ func lx_scan_symbol() -> i64 {
     }
     // 无法识别：取一个完整码点的原文本
     var bad = lx_cur_cp()
-    em_fail(sl, sc, "无法识别的字符 '" + bad + "'")
+    em_fail_lex(sl, sc, "无法识别的字符 '" + bad + "'")
     return -1
 }
 
@@ -1100,7 +1100,7 @@ func lx_scan_slash() -> i64 {
         lx_advan(2)
         while true {
             if lx_pos >= lx_n {
-                em_fail(sl, sc, "块注释未闭合")
+                em_fail_lex(sl, sc, "块注释未闭合")
                 return -1
             }
             var b = lx_byte(lx_pos)
@@ -1191,15 +1191,15 @@ pub func lx_next() -> bool {
             }
             var r2 = lx_scan_str_body(kind2, raw1)
             if r2 == -2 {
-                em_fail(sl, sc, "转义符后缺少字符")
+                em_fail_lex(sl, sc, "转义符后缺少字符")
                 return false
             }
             if r2 == -4 {
-                em_fail(sl, sc, "未知转义序列 \\" + lx_unesc)
+                em_fail_lex(sl, sc, "未知转义序列 \\" + lx_unesc)
                 return false
             }
             if r2 < 0 {
-                em_fail(sl, sc, "字符串未闭合")
+                em_fail_lex(sl, sc, "字符串未闭合")
                 return false
             }
             lx_emit_span(kind2, so, lx_pos, sl, sc)
@@ -1213,15 +1213,15 @@ pub func lx_next() -> bool {
                 lx_advan(3)
                 var r3 = lx_scan_triple()
                 if r3 == -2 {
-                    em_fail(sl3, sc3, "转义符后缺少字符")
+                    em_fail_lex(sl3, sc3, "转义符后缺少字符")
                     return false
                 }
                 if r3 == -4 {
-                    em_fail(sl3, sc3, "未知转义序列 \\" + lx_unesc)
+                    em_fail_lex(sl3, sc3, "未知转义序列 \\" + lx_unesc)
                     return false
                 }
                 if r3 < 0 {
-                    em_fail(sl3, sc3, "字符串未闭合")
+                    em_fail_lex(sl3, sc3, "字符串未闭合")
                     return false
                 }
                 lx_emit_span(K_STR, so3, lx_pos, sl3, sc3)
@@ -1230,15 +1230,15 @@ pub func lx_next() -> bool {
             lx_adv1()
             var r4 = lx_scan_str_body(K_STR, 0)
             if r4 == -2 {
-                em_fail(sl3, sc3, "转义符后缺少字符")
+                em_fail_lex(sl3, sc3, "转义符后缺少字符")
                 return false
             }
             if r4 == -4 {
-                em_fail(sl3, sc3, "未知转义序列 \\" + lx_unesc)
+                em_fail_lex(sl3, sc3, "未知转义序列 \\" + lx_unesc)
                 return false
             }
             if r4 < 0 {
-                em_fail(sl3, sc3, "字符串未闭合")
+                em_fail_lex(sl3, sc3, "字符串未闭合")
                 return false
             }
             lx_emit_span(K_STR, so3, lx_pos, sl3, sc3)

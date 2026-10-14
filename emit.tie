@@ -99,6 +99,7 @@ pub var em_src: string = "";            // 源文本（当前会话保留一份�
 var em_err_l: i64 = 0;
 var em_err_c: i64 = 0;
 var em_err_m: string = "";
+var em_err_k: i64 = 0;      // 错误类别：0 无 / 1 词法 / 2 语法
 var em_has_err: bool = false;
 
 // ---------- 每 tag 槽数（4 / 6 / 8 档；默认 4） ----------
@@ -328,17 +329,33 @@ pub func em_clear_err() {
     em_err_l = 0
     em_err_c = 0
     em_err_m = ""
+    em_err_k = 0
     em_has_err = false
 }
 
-pub func em_fail(line: i64, col: i64, msg: string) {
+pub func em_fail_k(k: i64, line: i64, col: i64, msg: string) {
     if em_has_err {
         return
     }
+    em_err_k = k
     em_err_l = line
     em_err_c = col
     em_err_m = msg
     em_has_err = true
+}
+
+// 语法类错误（缺省类别）
+pub func em_fail(line: i64, col: i64, msg: string) {
+    em_fail_k(2, line, col, msg)
+}
+
+// 词法类错误
+pub func em_fail_lex(line: i64, col: i64, msg: string) {
+    em_fail_k(1, line, col, msg)
+}
+
+pub func em_err_kind() -> i64 {
+    return em_err_k
 }
 
 pub func em_ok() -> bool {
