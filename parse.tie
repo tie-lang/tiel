@@ -28,6 +28,11 @@ const PS_B_REST: i64 = 1;       // A_BIND：剩余（...rest）
 // ---------- 词元前瞻队列（容量小；出队即前移） ----------
 var ps_dead: bool = false;
 var ps_gt_pend: i64 = 0;        // 类型位 `>>` 拆分余量（嵌套泛型 `table<table<i64>>`）
+var ps_ll: i64 = 0;             // 最近消费词元的行号（语句结束检查的「新行」判据）
+// ---------- 位置快照（探测回退：三目 / `?` 后缀解包消歧） ----------
+// 快照面 = 词法游标与行状态 + 词元队列 + ps 标量 + 错误槽；栈式、可嵌套。
+var ps_ss_n: table<table<i64>> = [];      // 数值快照栈（每层一个编码表）
+var ps_ss_s: table<table<string>> = [];   // 字符串快照栈（每层 unesc / err_msg / err_code）
 var pq_tag: table<i64> = [];
 var pq_line: table<i64> = [];
 var pq_col: table<i64> = [];
@@ -125,7 +130,168 @@ func ps_qid(k: i64) -> i64 {
 
 func ps_adv() {
     ps_ensure(0)
+    ps_ll = pq_line[0]
     pq_shift()
+}
+
+// 逐元素追加（深拷贝用；禁用浅拷贝——table_pop 穿透别名）
+func ps_pa(ref dst: table<i64>, src: table<i64>) {
+    var i: i64 = 0
+    while i < len(src) {
+        table_push(dst, src[i])
+        i = i + 1
+    }
+}
+
+// 位置快照（与 ps_restore 配对；栈式，探测可嵌套）
+func ps_save() {
+    var (lp, ll, lc, lpar, lt, ht, lun) = lx_snap()
+    var (eh, el, ec, ek, ems, ex) = em_err_snap()
+    var s: table<i64> = table_new_i64()
+    table_push(s, lp)
+    table_push(s, ll)
+    table_push(s, lc)
+    table_push(s, lpar)
+    table_push(s, lt)
+    table_push(s, ht)
+    table_push(s, len(pq_tag))
+    table_push(s, len(pq_line))
+    table_push(s, len(pq_col))
+    table_push(s, len(pq_off))
+    table_push(s, len(pq_len))
+    table_push(s, len(pq_id))
+    ps_pa(s, pq_tag)
+    ps_pa(s, pq_line)
+    ps_pa(s, pq_col)
+    ps_pa(s, pq_off)
+    ps_pa(s, pq_len)
+    ps_pa(s, pq_id)
+    if ps_dead {
+        table_push(s, 1)
+    } else {
+        table_push(s, 0)
+    }
+    table_push(s, ps_gt_pend)
+    table_push(s, ps_ll)
+    table_push(s, eh)
+    table_push(s, el)
+    table_push(s, ec)
+    table_push(s, ek)
+    table_push(ps_ss_n, s)
+    var t2: table<string> = table_new_string()
+    table_push(t2, lun)
+    table_push(t2, ems)
+    table_push(t2, ex)
+    table_push(ps_ss_s, t2)
+}
+
+// 恢复最近一次 ps_save 的位置（弹栈；队列重填、行状态与错误槽还原）
+func ps_restore() {
+    var si = len(ps_ss_n) - 1
+    var s = ps_ss_n[si]
+    var t2 = ps_ss_s[si]
+    table_pop(ps_ss_n)
+    table_pop(ps_ss_s)
+    var i: i64 = 0
+    var lp = s[i]
+    i = i + 1
+    var ll = s[i]
+    i = i + 1
+    var lc = s[i]
+    i = i + 1
+    var lpar = s[i]
+    i = i + 1
+    var lt = s[i]
+    i = i + 1
+    var ht = s[i]
+    i = i + 1
+    var n1 = s[i]
+    i = i + 1
+    var n2 = s[i]
+    i = i + 1
+    var n3 = s[i]
+    i = i + 1
+    var n4 = s[i]
+    i = i + 1
+    var n5 = s[i]
+    i = i + 1
+    var n6 = s[i]
+    i = i + 1
+    lx_unsnap(lp, ll, lc, lpar, lt, ht, t2[0])
+    while len(pq_tag) > 0 {
+        table_pop(pq_tag)
+    }
+    while len(pq_line) > 0 {
+        table_pop(pq_line)
+    }
+    while len(pq_col) > 0 {
+        table_pop(pq_col)
+    }
+    while len(pq_off) > 0 {
+        table_pop(pq_off)
+    }
+    while len(pq_len) > 0 {
+        table_pop(pq_len)
+    }
+    while len(pq_id) > 0 {
+        table_pop(pq_id)
+    }
+    var j: i64 = 0
+    while j < n1 {
+        table_push(pq_tag, s[i])
+        i = i + 1
+        j = j + 1
+    }
+    j = 0
+    while j < n2 {
+        table_push(pq_line, s[i])
+        i = i + 1
+        j = j + 1
+    }
+    j = 0
+    while j < n3 {
+        table_push(pq_col, s[i])
+        i = i + 1
+        j = j + 1
+    }
+    j = 0
+    while j < n4 {
+        table_push(pq_off, s[i])
+        i = i + 1
+        j = j + 1
+    }
+    j = 0
+    while j < n5 {
+        table_push(pq_len, s[i])
+        i = i + 1
+        j = j + 1
+    }
+    j = 0
+    while j < n6 {
+        table_push(pq_id, s[i])
+        i = i + 1
+        j = j + 1
+    }
+    var dv = s[i]
+    i = i + 1
+    if dv == 1 {
+        ps_dead = true
+    } else {
+        ps_dead = false
+    }
+    ps_gt_pend = s[i]
+    i = i + 1
+    ps_ll = s[i]
+    i = i + 1
+    var eh = s[i]
+    i = i + 1
+    var el = s[i]
+    i = i + 1
+    var ec = s[i]
+    i = i + 1
+    var ek = s[i]
+    i = i + 1
+    em_err_unsnap(eh, el, ec, ek, t2[1], t2[2])
 }
 
 // ---------- 词元描述（describe；对齐现管线的调试名） ----------
@@ -1008,6 +1174,27 @@ func ps_e_postfix() -> i64 {
             em_put(oc2, 2, idx2)
             left = oc2
         } else if k == K_QUESTION {
+            // `?`（后缀解包）与三目（cond ? then : else）共用词元——探测消歧：
+            // 吃 `?` 后若能解析出完整表达式且其后紧跟 ':'，判为三目（快照还原、
+            // 不消费，留给 ps_e_ternary 构造）；否则按后缀解包消费。
+            var nx = ps_kind(1)
+            var probe = true
+            if nx == K_RPAREN || nx == K_RBRACKET || nx == K_RBRACE || nx == K_COMMA || nx == K_SEMI || nx == K_EOF {
+                probe = false
+            }
+            var is3 = false
+            if probe {
+                ps_save()
+                ps_adv()
+                var th = ps_expr()
+                if th >= 0 && ps_kind(0) == K_COLON {
+                    is3 = true
+                }
+                ps_restore()
+            }
+            if is3 {
+                break
+            }
             ps_adv()
             var tp = em_new(T_E_TRYPOP)
             em_put(tp, 1, left)
@@ -1389,9 +1576,38 @@ func ps_e_or() -> i64 {
     return left
 }
 
+// 条件取值 cond ? then : else（右结合；`?` 的消歧探测在 ps_e_postfix——
+// 探测判定为三目时还原词法不消费，回到本层构造）
+func ps_e_ternary() -> i64 {
+    var left = ps_e_or()
+    if left < 0 {
+        return -1
+    }
+    if ps_kind(0) == K_QUESTION {
+        ps_adv()
+        var then_e = ps_expr()
+        if then_e < 0 {
+            return -1
+        }
+        if !ps_expect(K_COLON, "':'") {
+            return -1
+        }
+        var else_e = ps_expr()
+        if else_e < 0 {
+            return -1
+        }
+        var n = em_new(T_E_TERNARY)
+        em_put(n, 1, left)
+        em_put(n, 2, then_e)
+        em_put(n, 3, else_e)
+        return n
+    }
+    return left
+}
+
 // ?: 安全默认值（右结合）
 func ps_e_defval() -> i64 {
-    var left = ps_e_or()
+    var left = ps_e_ternary()
     if left < 0 {
         return -1
     }
@@ -1691,33 +1907,8 @@ func ps_params(ref lst: table<i64>) -> bool {
     return true
 }
 
-// 是否可作语句开头（白名单；误报代价高）
-func ps_stmt_start(k: i64) -> bool {
-    if k == K_IDENT || k == K_INT || k == K_FLOAT || k == K_STR || k == K_INTERP || k == K_CHAR {
-        return true
-    }
-    if k == KW_TRUE || k == KW_FALSE || k == KW_ZERO {
-        return true
-    }
-    if k == KW_VAR || k == KW_CONST || k == KW_IF || k == KW_WHILE || k == KW_FOR || k == KW_SWITCH {
-        return true
-    }
-    if k == KW_NAMESPACE || k == KW_ENUM || k == KW_ALIAS || k == KW_IMPORT || k == KW_USING || k == KW_PUB {
-        return true
-    }
-    if k == KW_RETURN || k == KW_BREAK || k == KW_CONTINUE || k == KW_PANIC || k == KW_FUNC {
-        return true
-    }
-    if k == K_LPAREN || k == K_LBRACKET || k == K_LBRACE {
-        return true
-    }
-    if k == K_MINUS || k == K_BANG || k == K_TILDE || k == K_INC || k == K_DEC {
-        return true
-    }
-    return false
-}
-
-// 语句结束检查（非分号时必须能开始下一语句）
+// 语句结束检查（对齐现管线的 expect_stmt_end 口径）：分号 / 块闭合 '}' /
+// 文件结束 / 新行（ASI 未补分号的收尾场景）/ 块类与声明类起首（同行可接）。
 func ps_after_stmt() -> bool {
     if ps_kind(0) == K_SEMI {
         ps_adv()
@@ -1726,7 +1917,14 @@ func ps_after_stmt() -> bool {
     if ps_kind(0) == K_RBRACE || ps_kind(0) == K_EOF {
         return true
     }
-    if ps_stmt_start(ps_kind(0)) {
+    if ps_line(0) > ps_ll {
+        return true
+    }
+    var k = ps_kind(0)
+    if k == KW_IF || k == KW_WHILE || k == KW_FOR || k == KW_SWITCH || k == KW_CASE || k == KW_DEFAULT {
+        return true
+    }
+    if k == KW_FUNC || k == KW_NAMESPACE || k == KW_ENUM || k == KW_ALIAS || k == KW_IMPORT || k == KW_USING || k == KW_PUB {
         return true
     }
     ps_err_here("期望 语句结束符，实际是 " + ps_kdesc(0))
@@ -2477,6 +2675,13 @@ pub func ps_parse(src: string) -> i64 {
     em_reset()
     ps_dead = false
     ps_gt_pend = 0
+    ps_ll = 0
+    while len(ps_ss_n) > 0 {
+        table_pop(ps_ss_n)
+    }
+    while len(ps_ss_s) > 0 {
+        table_pop(ps_ss_s)
+    }
     pq_clear()
     var body = ps_strip_header(src)
     lx_start(body)
