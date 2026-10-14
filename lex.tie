@@ -407,6 +407,26 @@ func lx_scan_ident() -> i64 {
 }
 
 // ---------- 数值字面量 ----------
+// 类型后缀（i8…u128 / f32 / f64）：命中关键字表才算后缀，否则回退
+// （十进制与各进制共用）
+func lx_try_suffix() {
+    if lx_pos < lx_n {
+        if lx_is_ident_cont(lx_byte(lx_pos)) {
+            var sso = lx_pos
+            while lx_pos < lx_n {
+                if !lx_is_ident_cont(lx_byte(lx_pos)) {
+                    break
+                }
+                lx_adv1()
+            }
+            var suf = str_sub_bytes(lx_src, sso, lx_pos)
+            if lx_kw_find(suf) < 0 {
+                lx_pos = sso
+            }
+        }
+    }
+}
+
 func lx_scan_number() -> i64 {
     var so = lx_pos
     var sl = lx_cur_line
@@ -425,6 +445,7 @@ func lx_scan_number() -> i64 {
                     break
                 }
             }
+            lx_try_suffix()
             lx_emit_span(K_INT, so, lx_pos, sl, sc)
             return 1
         }
@@ -438,6 +459,7 @@ func lx_scan_number() -> i64 {
                     break
                 }
             }
+            lx_try_suffix()
             lx_emit_span(K_INT, so, lx_pos, sl, sc)
             return 1
         }
@@ -451,6 +473,7 @@ func lx_scan_number() -> i64 {
                     break
                 }
             }
+            lx_try_suffix()
             lx_emit_span(K_INT, so, lx_pos, sl, sc)
             return 1
         }
@@ -464,6 +487,7 @@ func lx_scan_number() -> i64 {
                     break
                 }
             }
+            lx_try_suffix()
             lx_emit_span(K_INT, so, lx_pos, sl, sc)
             return 1
         }
@@ -514,22 +538,7 @@ func lx_scan_number() -> i64 {
             }
         }
     }
-    // 类型后缀（i8…u128 / f32 / f64）：命中关键字表才算后缀，否则回退
-    if lx_pos < lx_n {
-        if lx_is_ident_cont(lx_byte(lx_pos)) {
-            var sso = lx_pos
-            while lx_pos < lx_n {
-                if !lx_is_ident_cont(lx_byte(lx_pos)) {
-                    break
-                }
-                lx_adv1()
-            }
-            var suf = str_sub_bytes(lx_src, sso, lx_pos)
-            if lx_kw_find(suf) < 0 {
-                lx_pos = sso
-            }
-        }
-    }
+    lx_try_suffix()
     if is_float {
         lx_emit_span(K_FLOAT, so, lx_pos, sl, sc)
     } else {
@@ -642,16 +651,15 @@ func lx_scan_str_body(kind: i64, raw: i64) -> i64 {
             var e = lx_byte(lx_pos)
             if e == 110 || e == 116 || e == 114 || e == 92 || e == 34 || e == 39 || e == 48 {
                 lx_adv1()
-            } else if e == 10 {
-                return -3                       // 串内换行（未闭合）
             } else {
                 lx_unesc = str_from_code(e)
-                return -4                       // 未知转义序列
+                return -4                       // 未知转义序列（含 `\`+换行）
             }
             continue
         }
         if b == 10 {
-            return -3
+            lx_adv_nl()                         // 普通/插值串可跨行（闭合引号为准）
+            continue
         }
         if kind == K_INTERP && b == 123 {       // '{'：插值段或字面 '{{'
             if lx_peek(1) == 123 {
