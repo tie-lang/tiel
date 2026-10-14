@@ -462,8 +462,9 @@ func ps_type_name() -> i64 {
     // 类型词（共用「类型 'x'」描述）或用户类型名
     var k = ps_kind(0)
     if ps_is_typeword(k) {
+        var nm = ps_text(0)        // 类型词文本须在消费前取（adv 后队列已前移）
         ps_adv()
-        return em_nameid(ps_text(0))
+        return em_nameid(nm)
     }
     if k == K_IDENT {
         var nid = ps_qid(0)
