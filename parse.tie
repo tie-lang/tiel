@@ -350,7 +350,7 @@ func ps_type() -> i64 {
                 break
             }
         }
-        if !ps_expect(K_RPAREN, "(") {
+        if !ps_expect(K_RPAREN, "')'") {
             return -1
         }
         var ret: i64 = 0
@@ -404,7 +404,7 @@ func ps_type() -> i64 {
             }
             break
         }
-        if !ps_expect(K_RPAREN, "(") {
+        if !ps_expect(K_RPAREN, "')'") {
             return -1
         }
         ps_set_seg(n2, 1, els)
@@ -434,7 +434,7 @@ func ps_type() -> i64 {
             }
             break
         }
-        if !ps_expect(K_GT, ">") {
+        if !ps_expect(K_GT, "'>'") {
             return -1
         }
         ps_set_seg(ap, 2, args2)
@@ -461,14 +461,14 @@ func ps_ifexpr() -> i64 {
     if cond < 0 {
         return -1
     }
-    if !ps_expect(K_LBRACE, "{") {
+    if !ps_expect(K_LBRACE, "'{'") {
         return -1
     }
     var then_e = ps_expr()
     if then_e < 0 {
         return -1
     }
-    if !ps_expect(K_RBRACE, "}") {
+    if !ps_expect(K_RBRACE, "'}'") {
         return -1
     }
     if ps_kind(0) != KW_ELSE {
@@ -480,14 +480,14 @@ func ps_ifexpr() -> i64 {
     if ps_kind(0) == KW_IF {
         else_e = ps_ifexpr()
     } else {
-        if !ps_expect(K_LBRACE, "{") {
+        if !ps_expect(K_LBRACE, "'{'") {
             return -1
         }
         else_e = ps_expr()
         if else_e < 0 {
             return -1
         }
-        if !ps_expect(K_RBRACE, "}") {
+        if !ps_expect(K_RBRACE, "'}'") {
             return -1
         }
     }
@@ -508,7 +508,7 @@ func ps_switchexpr() -> i64 {
     if obj < 0 {
         return -1
     }
-    if !ps_expect(K_LBRACE, "{") {
+    if !ps_expect(K_LBRACE, "'{'") {
         return -1
     }
     var cases: table<i64> = []
@@ -523,6 +523,8 @@ func ps_switchexpr() -> i64 {
             return -1
         }
         // 模式（可为 `_` 通配）
+        var pat_l = ps_line(0)
+        var pat_c = ps_col(0)
         var pat = ps_pattern()
         if pat < 0 {
             return -1
@@ -530,13 +532,13 @@ func ps_switchexpr() -> i64 {
         if em_tag(pat) == T_E_IDENT {
             if em_namestr(em_get(pat, 1)) == "_" {
                 if seen_wild != 0 {
-                    ps_err_here("switch 表达式不允许重复的 `_` 通配臂")
+                    em_fail(pat_l, pat_c, "switch 表达式不允许重复的 `_` 通配臂")
                     return -1
                 }
                 seen_wild = 1
             }
         }
-        if !ps_expect(K_ARROW, "->") {
+        if !ps_expect(K_ARROW, "'->'") {
             return -1
         }
         var body = ps_expr()
@@ -594,7 +596,7 @@ func ps_pattern() -> i64 {
 // 闭包字面量（func ( params ) -> R { body }）
 func ps_closure() -> i64 {
     ps_adv()                                   // func
-    if !ps_expect(K_LPAREN, "(") {
+    if !ps_expect(K_LPAREN, "'('") {
         return -1
     }
     var sig: table<i64> = table_new_i64()
@@ -613,7 +615,7 @@ func ps_closure() -> i64 {
             break
         }
     }
-    if !ps_expect(K_RPAREN, "(") {
+    if !ps_expect(K_RPAREN, "')'") {
         return -1
     }
     if ps_kind(0) == K_ARROW {
@@ -730,11 +732,11 @@ func ps_len_of(k: i64) -> i64 {
 
 // 括号：分组 或 元组字面量
 func ps_paren_tuple() -> i64 {
-    ps_adv()                                   // (
-    if ps_kind(0) == K_RPAREN {
+    if ps_kind(1) == K_RPAREN {
         ps_err_here("空元组 () 不支持")
         return -1
     }
+    ps_adv()                                   // (
     var first = ps_expr()
     if first < 0 {
         return -1
@@ -753,14 +755,14 @@ func ps_paren_tuple() -> i64 {
             }
             table_push(els, e)
         }
-        if !ps_expect(K_RPAREN, "(") {
+        if !ps_expect(K_RPAREN, "')'") {
             return -1
         }
         var t = em_new(T_E_TUPLE)
         ps_set_seg(t, 1, els)
         return t
     }
-    if !ps_expect(K_RPAREN, "(") {
+    if !ps_expect(K_RPAREN, "')'") {
         return -1
     }
     return first
@@ -813,7 +815,7 @@ func ps_table_lit() -> i64 {
             }
             break
         }
-        if !ps_expect(K_RBRACKET, "]") {
+        if !ps_expect(K_RBRACKET, "']'") {
             return -1
         }
         var m = em_new(T_E_MAP)
@@ -823,7 +825,14 @@ func ps_table_lit() -> i64 {
     // 表元素列表
     var els: table<i64> = []
     table_push(els, first)
-    while ps_kind(0) == K_COMMA {
+    while true {
+        if ps_kind(0) == K_RBRACKET {
+            break
+        }
+        if ps_kind(0) != K_COMMA {
+            ps_err_here("期望 , 或 ; 或 ]，实际是 " + ps_kdesc(0))
+            return -1
+        }
         ps_adv()
         if ps_kind(0) == K_RBRACKET {
             break
@@ -834,9 +843,7 @@ func ps_table_lit() -> i64 {
         }
         table_push(els, e)
     }
-    if !ps_expect(K_RBRACKET, "]") {
-        return -1
-    }
+    ps_adv()
     var t = em_new(T_E_TABLE)
     ps_set_seg(t, 1, els)
     return t
@@ -852,7 +859,7 @@ func ps_comp_tail(sel: i64) -> i64 {
         if nid < 0 {
             return -1
         }
-        if !ps_expect(KW_IN, "in") {
+        if !ps_expect(KW_IN, "'in'") {
             return -1
         }
         var s = ps_expr()
@@ -870,7 +877,7 @@ func ps_comp_tail(sel: i64) -> i64 {
             return -1
         }
     }
-    if !ps_expect(K_RBRACKET, "]") {
+    if !ps_expect(K_RBRACKET, "']'") {
         return -1
     }
     // 从内往外组装（cond 挂在最内层）
@@ -918,7 +925,7 @@ func ps_e_postfix() -> i64 {
                     break
                 }
             }
-            if !ps_expect(K_RPAREN, "(") {
+            if !ps_expect(K_RPAREN, "')'") {
                 return -1
             }
             var c = em_new(T_E_CALL)
@@ -931,7 +938,7 @@ func ps_e_postfix() -> i64 {
             if idx < 0 {
                 return -1
             }
-            if !ps_expect(K_RBRACKET, "]") {
+            if !ps_expect(K_RBRACKET, "']'") {
                 return -1
             }
             var ix = em_new(T_E_INDEX)
@@ -966,7 +973,7 @@ func ps_e_postfix() -> i64 {
             if idx2 < 0 {
                 return -1
             }
-            if !ps_expect(K_RBRACKET, "]") {
+            if !ps_expect(K_RBRACKET, "']'") {
                 return -1
             }
             var oc2 = em_new(T_E_OPTCHAIN)
@@ -1443,7 +1450,7 @@ func ps_pipe_rhs(left: i64) -> i64 {
         if idx < 0 {
             return -1
         }
-        if !ps_expect(K_RBRACKET, "]") {
+        if !ps_expect(K_RBRACKET, "']'") {
             return -1
         }
         var ix = em_new(T_E_INDEX)
@@ -1500,7 +1507,7 @@ func ps_postfix_tail(base: i64) -> i64 {
                     break
                 }
             }
-            if !ps_expect(K_RPAREN, "(") {
+            if !ps_expect(K_RPAREN, "')'") {
                 return -1
             }
             var c = em_new(T_E_CALL)
@@ -1513,7 +1520,7 @@ func ps_postfix_tail(base: i64) -> i64 {
             if idx < 0 {
                 return -1
             }
-            if !ps_expect(K_RBRACKET, "]") {
+            if !ps_expect(K_RBRACKET, "']'") {
                 return -1
             }
             var ix = em_new(T_E_INDEX)
@@ -1583,6 +1590,8 @@ func ps_param() -> i64 {
         return -1
     }
     var ty: i64 = 0
+    var ty_l: i64 = 0
+    var ty_c: i64 = 0
     var is_var: i64 = 0
     if ps_kind(0) == K_COLON {
         ps_adv()
@@ -1590,6 +1599,8 @@ func ps_param() -> i64 {
             is_var = 1
             ps_adv()
         }
+        ty_l = ps_line(0)
+        ty_c = ps_col(0)
         ty = ps_type()
         if ty < 0 {
             return -1
@@ -1597,11 +1608,11 @@ func ps_param() -> i64 {
     }
     if is_var == 1 {
         if conv == 1 {
-            ps_err_here("变参参数不能同时使用 ref 修饰")
+            em_fail(ty_l, ty_c, "变参参数不能同时使用 ref 修饰")
             return -1
         }
         if conv == 2 {
-            ps_err_here("变参参数不能同时使用 immut 修饰")
+            em_fail(ty_l, ty_c, "变参参数不能同时使用 immut 修饰")
             return -1
         }
         conv = 3
@@ -1609,6 +1620,7 @@ func ps_param() -> i64 {
     var dflt: i64 = 0
     if ps_kind(0) == K_EQ {
         if conv == 3 {
+            ps_adv()
             ps_err_here("变参参数不能有默认值")
             return -1
         }
@@ -1638,6 +1650,10 @@ func ps_params(ref lst: table<i64>) -> bool {
         }
         table_push(lst, p)
         if ps_kind(0) == K_COMMA {
+            if em_get(p, 3) == 3 {
+                ps_err_here("变参参数必须是最后一个参数")
+                return false
+            }
             ps_adv()
             continue
         }
@@ -1646,9 +1662,51 @@ func ps_params(ref lst: table<i64>) -> bool {
     return true
 }
 
+// 是否可作语句开头（白名单；误报代价高）
+func ps_stmt_start(k: i64) -> bool {
+    if k == K_IDENT || k == K_INT || k == K_FLOAT || k == K_STR || k == K_INTERP || k == K_CHAR {
+        return true
+    }
+    if k == KW_TRUE || k == KW_FALSE || k == KW_ZERO {
+        return true
+    }
+    if k == KW_VAR || k == KW_CONST || k == KW_IF || k == KW_WHILE || k == KW_FOR || k == KW_SWITCH {
+        return true
+    }
+    if k == KW_NAMESPACE || k == KW_ENUM || k == KW_ALIAS || k == KW_IMPORT || k == KW_USING || k == KW_PUB {
+        return true
+    }
+    if k == KW_RETURN || k == KW_BREAK || k == KW_CONTINUE || k == KW_PANIC || k == KW_FUNC {
+        return true
+    }
+    if k == K_LPAREN || k == K_LBRACKET || k == K_LBRACE {
+        return true
+    }
+    if k == K_MINUS || k == K_BANG || k == K_TILDE || k == K_INC || k == K_DEC {
+        return true
+    }
+    return false
+}
+
+// 语句结束检查（非分号时必须能开始下一语句）
+func ps_after_stmt() -> bool {
+    if ps_kind(0) == K_SEMI {
+        ps_adv()
+        return true
+    }
+    if ps_kind(0) == K_RBRACE || ps_kind(0) == K_EOF {
+        return true
+    }
+    if ps_stmt_start(ps_kind(0)) {
+        return true
+    }
+    ps_err_here("期望 语句结束符，实际是 " + ps_kdesc(0))
+    return false
+}
+
 // ---------- 块与语句 ----------
 func ps_block() -> i64 {
-    if !ps_expect(K_LBRACE, "{") {
+    if !ps_expect(K_LBRACE, "'{'") {
         return -1
     }
     var kids: table<i64> = []
@@ -1665,11 +1723,11 @@ func ps_block() -> i64 {
             return -1
         }
         table_push(kids, s)
-        if ps_kind(0) == K_SEMI {
-            ps_adv()
+        if !ps_after_stmt() {
+            return -1
         }
     }
-    if !ps_expect(K_RBRACE, "}") {
+    if !ps_expect(K_RBRACE, "'}'") {
         return -1
     }
     var n = em_new(T_S_BLOCK)
@@ -1700,8 +1758,8 @@ func ps_binds_paren(ref lst: table<i64>) -> bool {
             em_put(rb, 2, PS_B_REST)
             table_push(lst, rb)
             if ps_kind(0) == K_COMMA {
-                ps_adv()
-                continue
+                ps_err_here("剩余解构 '...rest' 必须位于解构列表末位")
+                return false
             }
             break
         }
@@ -1723,6 +1781,8 @@ func ps_binds_paren(ref lst: table<i64>) -> bool {
 
 // var / const 声明（含解构）
 func ps_var_stmt(is_global: i64, is_pub: i64) -> i64 {
+    var v_l = ps_line(0)
+    var v_c = ps_col(0)
     var is_const: i64 = 0
     if ps_kind(0) == KW_CONST {
         is_const = 1
@@ -1732,13 +1792,13 @@ func ps_var_stmt(is_global: i64, is_pub: i64) -> i64 {
     if ps_kind(0) == K_LPAREN {
         ps_adv()
         if ps_kind(0) == K_RPAREN {
-            ps_err_here("空解构 () 不支持")
+            em_fail(v_l, v_c, "空解构 () 不支持")
             return -1
         }
         if !ps_binds_paren(binds) {
             return -1
         }
-        if !ps_expect(K_RPAREN, "(") {
+        if !ps_expect(K_RPAREN, "')'") {
             return -1
         }
     } else {
@@ -1830,18 +1890,20 @@ func ps_while_stmt(lbl: i64) -> i64 {
 }
 
 func ps_for_stmt(lbl: i64) -> i64 {
+    var f_l = ps_line(0)
+    var f_c = ps_col(0)
     ps_adv()                                   // for
     var binds: table<i64> = table_new_i64()
     if ps_kind(0) == K_LPAREN {
         ps_adv()
         if ps_kind(0) == K_RPAREN {
-            ps_err_here("空解构 () 不支持")
+            em_fail(f_l, f_c, "空解构 () 不支持")
             return -1
         }
         if !ps_binds_paren(binds) {
             return -1
         }
-        if !ps_expect(K_RPAREN, "(") {
+        if !ps_expect(K_RPAREN, "')'") {
             return -1
         }
     } else {
@@ -1853,7 +1915,7 @@ func ps_for_stmt(lbl: i64) -> i64 {
         em_put(b, 1, nid)
         table_push(binds, b)
     }
-    if !ps_expect(KW_IN, "in") {
+    if !ps_expect(KW_IN, "'in'") {
         return -1
     }
     var src = ps_expr()
@@ -1902,8 +1964,8 @@ func ps_case_body() -> i64 {
             return -1
         }
         table_push(kids, s)
-        if ps_kind(0) == K_SEMI {
-            ps_adv()
+        if !ps_after_stmt() {
+            return -1
         }
     }
     var n = em_new(T_S_BLOCK)
@@ -1917,7 +1979,7 @@ func ps_switch_stmt() -> i64 {
     if obj < 0 {
         return -1
     }
-    if !ps_expect(K_LBRACE, "{") {
+    if !ps_expect(K_LBRACE, "'{'") {
         return -1
     }
     var cases: table<i64> = []
@@ -1946,7 +2008,7 @@ func ps_switch_stmt() -> i64 {
                 }
                 break
             }
-            if !ps_expect(K_COLON, ":") {
+            if !ps_expect(K_COLON, "':'") {
                 return -1
             }
             var body = ps_case_body()
@@ -1959,7 +2021,7 @@ func ps_switch_stmt() -> i64 {
             table_push(cases, c)
         } else if k == KW_DEFAULT {
             ps_adv()
-            if !ps_expect(K_COLON, ":") {
+            if !ps_expect(K_COLON, "':'") {
                 return -1
             }
             var body2 = ps_case_body()
@@ -1994,10 +2056,6 @@ func ps_stmt() -> i64 {
             lbl = ps_qid(0)
             ps_adv()
             ps_adv()
-        } else {
-            var lname = ps_text(0)
-            em_fail(ps_line(0), ps_col(0), "标签 '" + lname + "' 只能用于 while 或 for")
-            return -1
         }
     }
     var k = ps_kind(0)
@@ -2050,14 +2108,14 @@ func ps_stmt() -> i64 {
     }
     if k == KW_PANIC {
         ps_adv()
-        if !ps_expect(K_LPAREN, "(") {
+        if !ps_expect(K_LPAREN, "'('") {
             return -1
         }
         var pe = ps_expr()
         if pe < 0 {
             return -1
         }
-        if !ps_expect(K_RPAREN, "(") {
+        if !ps_expect(K_RPAREN, "')'") {
             return -1
         }
         var n5 = em_new(T_S_PANIC)
@@ -2078,16 +2136,16 @@ func ps_stmt() -> i64 {
         k3 == K_SLASHEQ || k3 == K_PERCENTEQ || k3 == K_PERCENTPPEQ ||
         k3 == K_BACKSLASHEQ || k3 == K_AMPEQ || k3 == K_PIPEEQ || k3 == K_CARETEQ ||
         k3 == K_SHLEQ || k3 == K_SHREQ {
-        var oline = ps_line(0)
-        var ocol = ps_col(0)
         ps_adv()
+        var rline = ps_line(0)
+        var rcol = ps_col(0)
         var rhs = ps_expr()
         if rhs < 0 {
             return -1
         }
         var tg = em_tag(e2)
         if tg != T_E_IDENT && tg != T_E_FIELD && tg != T_E_INDEX {
-            em_fail(oline, ocol, "赋值目标必须是变量或对象字段")
+            em_fail(rline, rcol, "赋值目标必须是变量或对象字段")
             return -1
         }
         var a = em_new(T_E_ASSIGN)
@@ -2108,7 +2166,7 @@ func ps_func_decl(is_pub: i64) -> i64 {
     if name < 0 {
         return -1
     }
-    if !ps_expect(K_LPAREN, "(") {
+    if !ps_expect(K_LPAREN, "'('") {
         return -1
     }
     var sig: table<i64> = table_new_i64()
@@ -2116,7 +2174,7 @@ func ps_func_decl(is_pub: i64) -> i64 {
     if !ps_params(sig) {
         return -1
     }
-    if !ps_expect(K_RPAREN, "(") {
+    if !ps_expect(K_RPAREN, "')'") {
         return -1
     }
     if ps_kind(0) == K_ARROW {
@@ -2134,7 +2192,7 @@ func ps_func_decl(is_pub: i64) -> i64 {
         ps_adv()
         body = ps_expr()
     } else {
-        ps_err_here("期望函数体（{ 或 =），实际是 " + ps_kdesc(0))
+        ps_err_here("期望 '{'，实际是 " + ps_kdesc(0))
         return -1
     }
     if body < 0 {
@@ -2158,7 +2216,7 @@ func ps_enum_decl(is_pub: i64) -> i64 {
     if name < 0 {
         return -1
     }
-    if !ps_expect(K_LBRACE, "{") {
+    if !ps_expect(K_LBRACE, "'{'") {
         return -1
     }
     var variants: table<i64> = []
@@ -2171,7 +2229,7 @@ func ps_enum_decl(is_pub: i64) -> i64 {
             break
         }
         if ps_kind(0) == K_EOF {
-            ps_err_here("期望标识符，实际是 " + ps_kdesc(0))
+            ps_err_here("期望 '}'，实际是 " + ps_kdesc(0))
             return -1
         }
         var vname = ps_expect_ident()
@@ -2184,7 +2242,7 @@ func ps_enum_decl(is_pub: i64) -> i64 {
             if !ps_params(payload) {
                 return -1
             }
-            if !ps_expect(K_RPAREN, "(") {
+            if !ps_expect(K_RPAREN, "')'") {
                 return -1
             }
         }
@@ -2229,7 +2287,7 @@ func ps_alias_decl(is_pub: i64) -> i64 {
     if name < 0 {
         return -1
     }
-    if !ps_expect(K_EQ, "=") {
+    if !ps_expect(K_EQ, "'='") {
         return -1
     }
     var ty = ps_type()
@@ -2335,7 +2393,7 @@ func ps_top_item() -> i64 {
 
 // 声明块（namespace 体）：允许顶层声明与语句（宽容），直至 '}'
 func ps_decl_block() -> i64 {
-    if !ps_expect(K_LBRACE, "{") {
+    if !ps_expect(K_LBRACE, "'{'") {
         return -1
     }
     var kids: table<i64> = []
@@ -2351,11 +2409,11 @@ func ps_decl_block() -> i64 {
             return -1
         }
         table_push(kids, item)
-        if ps_kind(0) == K_SEMI {
-            ps_adv()
+        if !ps_after_stmt() {
+            return -1
         }
     }
-    if !ps_expect(K_RBRACE, "}") {
+    if !ps_expect(K_RBRACE, "'}'") {
         return -1
     }
     var n = em_new(T_S_BLOCK)
@@ -2383,8 +2441,8 @@ pub func ps_parse(src: string) -> i64 {
             return -1
         }
         table_push(st, item)
-        if ps_kind(0) == K_SEMI {
-            ps_adv()
+        if !ps_after_stmt() {
+            return -1
         }
     }
     var root = em_new(T_S_BLOCK)
