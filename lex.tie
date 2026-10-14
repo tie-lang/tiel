@@ -164,6 +164,8 @@ var lx_paren: i64 = 0;         // 括号深度（只统计 ( 与 [）
 var lx_last_tag: i64 = -1;     // 本行最后词元
 var lx_has_tok: bool = false;  // 本行已有词元
 var lx_unesc: string = "";     // 未知转义字符暂存（串扫描填充）
+var lx_ss: table<i64> = [];       // 位置快照栈（探测回退；每层 6 个标量）
+var lx_sss: table<string> = [];   // 位置快照栈（每层 unesc）
 
 // 当前词元
 var lx_tag: i64 = 0;
@@ -334,29 +336,61 @@ pub func lx_start(src: string) {
     lx_t_off = 0
     lx_t_len = 0
     lx_t_id = -1
+    while len(lx_ss) > 0 {
+        table_pop(lx_ss)
+    }
+    while len(lx_sss) > 0 {
+        table_pop(lx_sss)
+    }
 }
 
-// ---------- 位置快照（供解析层探测回退；save/restore 配对） ----------
-pub func lx_snap() -> (i64, i64, i64, i64, i64, i64, string) {
+// ---------- 位置快照（供解析层探测回退；栈式、save/restore 配对、可嵌套） ----------
+pub func lx_save() {
+    table_push(lx_ss, lx_pos)
+    table_push(lx_ss, lx_cur_line)
+    table_push(lx_ss, lx_cur_col)
+    table_push(lx_ss, lx_paren)
+    table_push(lx_ss, lx_last_tag)
     var ht: i64 = 0
     if lx_has_tok {
         ht = 1
     }
-    return (lx_pos, lx_cur_line, lx_cur_col, lx_paren, lx_last_tag, ht, lx_unesc)
+    table_push(lx_ss, ht)
+    table_push(lx_sss, lx_unesc)
 }
 
-pub func lx_unsnap(pos: i64, line: i64, col: i64, paren: i64, last_tag: i64, has_tok: i64, unesc: string) {
-    lx_pos = pos
-    lx_cur_line = line
-    lx_cur_col = col
-    lx_paren = paren
-    lx_last_tag = last_tag
-    if has_tok == 1 {
+pub func lx_restore() {
+    var n = len(lx_ss)
+    if n < 6 {
+        return
+    }
+    var ht = lx_ss[n - 1]
+    var lt = lx_ss[n - 2]
+    var lpar = lx_ss[n - 3]
+    var lc = lx_ss[n - 4]
+    var ll = lx_ss[n - 5]
+    var lp = lx_ss[n - 6]
+    var i: i64 = 0
+    while i < 6 {
+        table_pop(lx_ss)
+        i = i + 1
+    }
+    var un: string = ""
+    if len(lx_sss) > 0 {
+        un = lx_sss[len(lx_sss) - 1]
+        table_pop(lx_sss)
+    }
+    lx_pos = lp
+    lx_cur_line = ll
+    lx_cur_col = lc
+    lx_paren = lpar
+    lx_last_tag = lt
+    if ht == 1 {
         lx_has_tok = true
     } else {
         lx_has_tok = false
     }
-    lx_unesc = unesc
+    lx_unesc = un
 }
 
 // ---------- 当前词元访问器 ----------

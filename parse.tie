@@ -31,8 +31,7 @@ var ps_gt_pend: i64 = 0;        // 类型位 `>>` 拆分余量（嵌套泛型 `t
 var ps_ll: i64 = 0;             // 最近消费词元的行号（语句结束检查的「新行」判据）
 // ---------- 位置快照（探测回退：三目 / `?` 后缀解包消歧） ----------
 // 快照面 = 词法游标与行状态 + 词元队列 + ps 标量 + 错误槽；栈式、可嵌套。
-var ps_ss_n: table<table<i64>> = [];      // 数值快照栈（每层一个编码表）
-var ps_ss_s: table<table<string>> = [];   // 字符串快照栈（每层 unesc / err_msg / err_code）
+var ps_ss_n: table<table<i64>> = [];      // 快照栈（每层一个编码表：词元队列 + ps 标量）
 var pq_tag: table<i64> = [];
 var pq_line: table<i64> = [];
 var pq_col: table<i64> = [];
@@ -143,17 +142,13 @@ func ps_pa(ref dst: table<i64>, src: table<i64>) {
     }
 }
 
-// 位置快照（与 ps_restore 配对；栈式，探测可嵌套）
+// 位置快照（与 ps_restore 配对；栈式，探测可嵌套）。
+// 词法游标/行状态与错误槽由 lex/emit 侧自带快照栈（lx_save / em_err_save）；
+// 本层只编码：词元队列 + ps 标量。
 func ps_save() {
-    var (lp, ll, lc, lpar, lt, ht, lun) = lx_snap()
-    var (eh, el, ec, ek, ems, ex) = em_err_snap()
+    lx_save()
+    em_err_save()
     var s: table<i64> = table_new_i64()
-    table_push(s, lp)
-    table_push(s, ll)
-    table_push(s, lc)
-    table_push(s, lpar)
-    table_push(s, lt)
-    table_push(s, ht)
     table_push(s, len(pq_tag))
     table_push(s, len(pq_line))
     table_push(s, len(pq_col))
@@ -173,38 +168,15 @@ func ps_save() {
     }
     table_push(s, ps_gt_pend)
     table_push(s, ps_ll)
-    table_push(s, eh)
-    table_push(s, el)
-    table_push(s, ec)
-    table_push(s, ek)
     table_push(ps_ss_n, s)
-    var t2: table<string> = table_new_string()
-    table_push(t2, lun)
-    table_push(t2, ems)
-    table_push(t2, ex)
-    table_push(ps_ss_s, t2)
 }
 
-// 恢复最近一次 ps_save 的位置（弹栈；队列重填、行状态与错误槽还原）
+// 恢复最近一次 ps_save 的位置（弹栈；队列重填 + 分层还原 lex/emit 快照）
 func ps_restore() {
     var si = len(ps_ss_n) - 1
     var s = ps_ss_n[si]
-    var t2 = ps_ss_s[si]
     table_pop(ps_ss_n)
-    table_pop(ps_ss_s)
     var i: i64 = 0
-    var lp = s[i]
-    i = i + 1
-    var ll = s[i]
-    i = i + 1
-    var lc = s[i]
-    i = i + 1
-    var lpar = s[i]
-    i = i + 1
-    var lt = s[i]
-    i = i + 1
-    var ht = s[i]
-    i = i + 1
     var n1 = s[i]
     i = i + 1
     var n2 = s[i]
@@ -217,7 +189,6 @@ func ps_restore() {
     i = i + 1
     var n6 = s[i]
     i = i + 1
-    lx_unsnap(lp, ll, lc, lpar, lt, ht, t2[0])
     while len(pq_tag) > 0 {
         table_pop(pq_tag)
     }
@@ -283,15 +254,8 @@ func ps_restore() {
     i = i + 1
     ps_ll = s[i]
     i = i + 1
-    var eh = s[i]
-    i = i + 1
-    var el = s[i]
-    i = i + 1
-    var ec = s[i]
-    i = i + 1
-    var ek = s[i]
-    i = i + 1
-    em_err_unsnap(eh, el, ec, ek, t2[1], t2[2])
+    em_err_restore()
+    lx_restore()
 }
 
 // ---------- 词元描述（describe；对齐现管线的调试名） ----------
@@ -2678,9 +2642,6 @@ pub func ps_parse(src: string) -> i64 {
     ps_ll = 0
     while len(ps_ss_n) > 0 {
         table_pop(ps_ss_n)
-    }
-    while len(ps_ss_s) > 0 {
-        table_pop(ps_ss_s)
     }
     pq_clear()
     var body = ps_strip_header(src)

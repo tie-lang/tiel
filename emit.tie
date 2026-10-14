@@ -106,6 +106,8 @@ var em_err_m: string = "";
 var em_err_x: string = "";  // 错误码（E 码；置错时经 ec_lookup 填入）
 var em_err_k: i64 = 0;      // 错误类别：0 无 / 1 词法 / 2 语法
 var em_has_err: bool = false;
+var em_es: table<i64> = [];       // 错误槽快照栈（探测回退；每层 he/l/c/k）
+var em_ess: table<string> = [];   // 错误槽快照栈（每层 msg/code）
 
 // ---------- 每 tag 槽数（4 / 6 / 8 档；默认 4） ----------
 pub func em_tsz(tag: i64) -> i64 {
@@ -337,6 +339,12 @@ pub func em_clear_err() {
     em_err_x = ""
     em_err_k = 0
     em_has_err = false
+    while len(em_es) > 0 {
+        table_pop(em_es)
+    }
+    while len(em_ess) > 0 {
+        table_pop(em_ess)
+    }
 }
 
 pub func em_fail_k(k: i64, line: i64, col: i64, msg: string) {
@@ -385,16 +393,42 @@ pub func em_err_code() -> string {
     return em_err_x
 }
 
-// ---------- 错误槽快照（供解析层探测回退；save/restore 配对） ----------
-pub func em_err_snap() -> (i64, i64, i64, i64, string, string) {
+// ---------- 错误槽快照（供解析层探测回退；栈式、save/restore 配对、可嵌套） ----------
+pub func em_err_save() {
     var he: i64 = 0
     if em_has_err {
         he = 1
     }
-    return (he, em_err_l, em_err_c, em_err_k, em_err_m, em_err_x)
+    table_push(em_es, he)
+    table_push(em_es, em_err_l)
+    table_push(em_es, em_err_c)
+    table_push(em_es, em_err_k)
+    table_push(em_ess, em_err_m)
+    table_push(em_ess, em_err_x)
 }
 
-pub func em_err_unsnap(he: i64, el: i64, ec: i64, ek: i64, emsg: string, ecode: string) {
+pub func em_err_restore() {
+    var n = len(em_es)
+    if n < 4 {
+        return
+    }
+    var ek = em_es[n - 1]
+    var ec = em_es[n - 2]
+    var el = em_es[n - 3]
+    var he = em_es[n - 4]
+    var i: i64 = 0
+    while i < 4 {
+        table_pop(em_es)
+        i = i + 1
+    }
+    var x: string = ""
+    var m: string = ""
+    if len(em_ess) >= 2 {
+        x = em_ess[len(em_ess) - 1]
+        table_pop(em_ess)
+        m = em_ess[len(em_ess) - 1]
+        table_pop(em_ess)
+    }
     if he == 1 {
         em_has_err = true
     } else {
@@ -403,8 +437,8 @@ pub func em_err_unsnap(he: i64, el: i64, ec: i64, ek: i64, emsg: string, ecode: 
     em_err_l = el
     em_err_c = ec
     em_err_k = ek
-    em_err_m = emsg
-    em_err_x = ecode
+    em_err_m = m
+    em_err_x = x
 }
 
 // ---------- 自检与统计 ----------
