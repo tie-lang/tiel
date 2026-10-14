@@ -144,21 +144,14 @@ pub func em_tsz(tag: i64) -> i64 {
 
 // ---------- 会话生命周期 ----------
 pub func em_reset() {
-    while len(em_pool) > 0 {
-        table_pop(em_pool)
-    }
-    while len(em_off) > 0 {
-        table_pop(em_off)
-    }
-    while len(em_ch) > 0 {
-        table_pop(em_ch)
-    }
-    while len(em_names) > 0 {
-        table_pop(em_names)
-    }
-    while len(em_bk) > 0 {
-        table_pop(em_bk)
-    }
+    // 清表 = 一次缩表（table_trunc 对标量/字符串表即 set_len——与逐元素 pop
+    // 语义等价、穿透别名，但不逐元素走表操作）。逐元素 pop 每轮上千次表操作，
+    // 是解析热路径的大头。
+    table_trunc(em_pool, 0)
+    table_trunc(em_off, 0)
+    table_trunc(em_ch, 0)
+    table_trunc(em_names, 0)
+    table_trunc(em_bk, 0)
     table_push(em_off, -1)     // id 0 占位
     em_cnt = 0
     em_src = ""
@@ -273,9 +266,7 @@ func em_bk_rehash() {
         table_push(old, em_bk[i])
         i = i + 1
     }
-    while len(em_bk) > 0 {
-        table_pop(em_bk)
-    }
+    table_trunc(em_bk, 0)
     var cap = len(old) * 2
     i = 0
     while i < cap {
@@ -340,12 +331,8 @@ pub func em_clear_err() {
     em_err_x = ""
     em_err_k = 0
     em_has_err = false
-    while len(em_es) > 0 {
-        table_pop(em_es)
-    }
-    while len(em_ess) > 0 {
-        table_pop(em_ess)
-    }
+    table_trunc(em_es, 0)
+    table_trunc(em_ess, 0)
 }
 
 pub func em_fail_k(k: i64, line: i64, col: i64, msg: string) {

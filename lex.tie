@@ -337,12 +337,8 @@ pub func lx_start(src: string) {
     lx_t_off = 0
     lx_t_len = 0
     lx_t_id = -1
-    while len(lx_ss) > 0 {
-        table_pop(lx_ss)
-    }
-    while len(lx_sss) > 0 {
-        table_pop(lx_sss)
-    }
+    table_trunc(lx_ss, 0)
+    table_trunc(lx_sss, 0)
 }
 
 // ---------- 位置快照（供解析层探测回退；栈式、save/restore 配对、可嵌套） ----------
@@ -440,6 +436,16 @@ func lx_kw_find(s: string) -> i64 {
         }
     }
     return -1
+}
+
+// 关键字规范文本（kind → 关键字表文本；非关键字返回空串）。
+// kw 值连续 100..150 ⇒ 下标 = kind - KW_ALIAS（与 lx_kw_keys 的升序一一对应）。
+pub func lx_kw_text(k: i64) -> string {
+    var i = k - KW_ALIAS
+    if i < 0 || i >= len(lx_kw_keys) {
+        return ""
+    }
+    return lx_kw_keys[i]
 }
 
 // ---------- 标识符 / 关键字 ----------

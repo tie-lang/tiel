@@ -2,7 +2,7 @@ type tie<class, unsafe:lock>
 // parse.tie —— tiel 前端的递归下降语法分析器（直写 emit 表示层）
 // 文件级 lock 授权：tiel 会话单线程（嵌入面文档已注「非线程安全」）⇒ 表访问免锁。
 // ============================================================
-// 形态：两词元以上前瞻（小队列），递归下降，覆盖 tsc 规范全部构造。
+// 形态：两词元前瞻（定点环形队列，免搬移），递归下降，覆盖 tsc 规范全部构造。
 //   入口 ps_parse(src)：头部保行剥离 → lx_start → 顶层块（S_BLOCK）→ 返回根 id。
 //
 // 两条核心纪律：
@@ -26,78 +26,69 @@ const PS_F_GLOBAL: i64 = 2;     // D_VAR：全局
 const PS_F_PUB: i64 = 4;        // D_VAR / D_FUNC：pub
 const PS_B_REST: i64 = 1;       // A_BIND：剩余（...rest）
 
-// ---------- 词元前瞻队列（容量小；出队即前移） ----------
+// ---------- 词元前瞻队列（固定容量环形；出队只移指针，不搬元素） ----------
+// 容量须 > 最大前瞻深度（ps_kind 最大 k=2 ⇒ 在队 ≤ 3；新增 k≥3 的调用须同步扩容）。
+const PQ_CAP: i64 = 4;
+// 快照栈层宽：head + n + dead + gt_pend + ll + 6 列 × 4 槽 = 29
+const PS_SNAP_W: i64 = 29;
 var ps_dead: bool = false;
 var ps_gt_pend: i64 = 0;        // 类型位 `>>` 拆分余量（嵌套泛型 `table<table<i64>>`）
 var ps_ll: i64 = 0;             // 最近消费词元的行号（语句结束检查的「新行」判据）
+var pq_head: i64 = 0;           // 队首物理槽（0..3）
+var pq_n: i64 = 0;              // 在队词元数（0..3）
 // ---------- 位置快照（探测回退：三目 / `?` 后缀解包消歧） ----------
-// 快照面 = 词法游标与行状态 + 词元队列 + ps 标量 + 错误槽；栈式、可嵌套。
-var ps_ss_n: table<table<i64>> = [];      // 快照栈（每层一个编码表：词元队列 + ps 标量）
-var pq_tag: table<i64> = [];
-var pq_line: table<i64> = [];
-var pq_col: table<i64> = [];
-var pq_off: table<i64> = [];
-var pq_len: table<i64> = [];
-var pq_id: table<i64> = [];
+// 快照面 = 词法游标与行状态 + 词元队列（环形全 4 槽） + ps 标量 + 错误槽；栈式、可嵌套。
+// 每层 = PS_SNAP_W 个标量平铺（环形槽值直接存取，免逐元素内容重拷贝）。
+var ps_ss: table<i64> = [];
+var pq_tag: table<i64> = [0, 0, 0, 0];
+var pq_line: table<i64> = [0, 0, 0, 0];
+var pq_col: table<i64> = [0, 0, 0, 0];
+var pq_off: table<i64> = [0, 0, 0, 0];
+var pq_len: table<i64> = [0, 0, 0, 0];
+var pq_id: table<i64> = [0, 0, 0, 0];
+
+// 逻辑位置 p（0 = 队首）→ 环形物理槽
+func pq_slot(p: i64) -> i64 {
+    return (pq_head + p) & 3
+}
+
+// 六列入队（写入给定物理槽；槽槽同步 + 计数）
+func pq_put(s: i64, tag: i64, line: i64, col: i64, off: i64, len2: i64, id: i64) {
+    pq_tag[s] = tag
+    pq_line[s] = line
+    pq_col[s] = col
+    pq_off[s] = off
+    pq_len[s] = len2
+    pq_id[s] = id
+    pq_n = pq_n + 1
+}
 
 // 入队一次（lx 当前词元快照）
 func pq_push_cur() {
-    table_push(pq_tag, lx_kind())
-    table_push(pq_line, lx_line())
-    table_push(pq_col, lx_col())
-    table_push(pq_off, lx_pos_off())
-    table_push(pq_len, lx_pos_len())
-    table_push(pq_id, lx_nameid())
+    pq_put(pq_slot(pq_n), lx_kind(), lx_line(), lx_col(), lx_pos_off(), lx_pos_len(), lx_nameid())
 }
 
-// 出队（前移 + 收缩）
-func pq_shift() {
-    var i: i64 = 1
-    var n = len(pq_tag)
-    while i < n {
-        pq_tag[i - 1] = pq_tag[i]
-        pq_line[i - 1] = pq_line[i]
-        pq_col[i - 1] = pq_col[i]
-        pq_off[i - 1] = pq_off[i]
-        pq_len[i - 1] = pq_len[i]
-        pq_id[i - 1] = pq_id[i]
-        i = i + 1
-    }
-    table_pop(pq_tag)
-    table_pop(pq_line)
-    table_pop(pq_col)
-    table_pop(pq_off)
-    table_pop(pq_len)
-    table_pop(pq_id)
+// 入队假 EOF（词法错后首错即停；off/len=0、id=-1）
+func pq_push_eof() {
+    pq_put(pq_slot(pq_n), K_EOF, lx_line(), lx_col(), 0, 0, -1)
 }
 
 func pq_clear() {
-    while len(pq_tag) > 0 {
-        pq_shift()
-    }
+    pq_head = 0
+    pq_n = 0
 }
 
 // 确保队列中至少 k+1 个词元（词法错后补假 EOF，首错即停保证词法错保留）
 func ps_ensure(k: i64) {
-    while len(pq_tag) <= k {
+    while pq_n <= k {
         if ps_dead {
-            table_push(pq_tag, K_EOF)
-            table_push(pq_line, lx_line())
-            table_push(pq_col, lx_col())
-            table_push(pq_off, 0)
-            table_push(pq_len, 0)
-            table_push(pq_id, -1)
+            pq_push_eof()
         } else {
             if lx_next() {
                 pq_push_cur()
             } else {
                 ps_dead = true
-                table_push(pq_tag, K_EOF)
-                table_push(pq_line, lx_line())
-                table_push(pq_col, lx_col())
-                table_push(pq_off, 0)
-                table_push(pq_len, 0)
-                table_push(pq_id, -1)
+                pq_push_eof()
             }
         }
     }
@@ -105,156 +96,122 @@ func ps_ensure(k: i64) {
 
 func ps_kind(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_tag[k]
+    return pq_tag[pq_slot(k)]
 }
 
 func ps_line(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_line[k]
+    return pq_line[pq_slot(k)]
 }
 
 func ps_col(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_col[k]
+    return pq_col[pq_slot(k)]
 }
 
 func ps_text(k: i64) -> string {
     ps_ensure(k)
-    return str_sub_bytes(em_src, pq_off[k], pq_off[k] + pq_len[k])
+    var s = pq_slot(k)
+    return str_sub_bytes(em_src, pq_off[s], pq_off[s] + pq_len[s])
 }
 
 func ps_qid(k: i64) -> i64 {
     ps_ensure(k)
-    return pq_id[k]
+    return pq_id[pq_slot(k)]
+}
+
+// 词元 k 的源文本是否等于字面量 lit（按字节比对源区段；免子串分配）
+func ps_span_eq(k: i64, lit: string) -> bool {
+    ps_ensure(k)
+    var s = pq_slot(k)
+    if pq_len[s] != len(lit) {
+        return false
+    }
+    var i: i64 = 0
+    var o = pq_off[s]
+    while i < len(lit) {
+        if str_byte(em_src, o + i) != str_byte(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
 }
 
 func ps_adv() {
     ps_ensure(0)
-    ps_ll = pq_line[0]
-    pq_shift()
+    ps_ll = pq_line[pq_head]
+    pq_head = (pq_head + 1) & 3
+    pq_n = pq_n - 1
 }
 
-// 逐元素追加（深拷贝用；禁用浅拷贝——table_pop 穿透别名）
-func ps_pa(ref dst: table<i64>, src: table<i64>) {
-    var i: i64 = 0
-    while i < len(src) {
-        table_push(dst, src[i])
-        i = i + 1
-    }
-}
-
-// 位置快照（与 ps_restore 配对；栈式，探测可嵌套）。
+// ---------- 位置快照（探测回退：三目 / `?` 后缀解包消歧；栈式、可嵌套） ----------
 // 词法游标/行状态与错误槽由 lex/emit 侧自带快照栈（lx_save / em_err_save）；
-// 本层只编码：词元队列 + ps 标量。
+// 本层只编码：环形队列（全 4 槽） + ps 标量。
 func ps_save() {
     lx_save()
     em_err_save()
-    var s: table<i64> = table_new_i64()
-    table_push(s, len(pq_tag))
-    table_push(s, len(pq_line))
-    table_push(s, len(pq_col))
-    table_push(s, len(pq_off))
-    table_push(s, len(pq_len))
-    table_push(s, len(pq_id))
-    ps_pa(s, pq_tag)
-    ps_pa(s, pq_line)
-    ps_pa(s, pq_col)
-    ps_pa(s, pq_off)
-    ps_pa(s, pq_len)
-    ps_pa(s, pq_id)
+    table_push(ps_ss, pq_head)
+    table_push(ps_ss, pq_n)
+    var dv: i64 = 0
     if ps_dead {
-        table_push(s, 1)
-    } else {
-        table_push(s, 0)
+        dv = 1
     }
-    table_push(s, ps_gt_pend)
-    table_push(s, ps_ll)
-    table_push(ps_ss_n, s)
+    table_push(ps_ss, dv)
+    table_push(ps_ss, ps_gt_pend)
+    table_push(ps_ss, ps_ll)
+    var s: i64 = 0
+    while s < PQ_CAP {
+        table_push(ps_ss, pq_tag[s])
+        table_push(ps_ss, pq_line[s])
+        table_push(ps_ss, pq_col[s])
+        table_push(ps_ss, pq_off[s])
+        table_push(ps_ss, pq_len[s])
+        table_push(ps_ss, pq_id[s])
+        s = s + 1
+    }
 }
 
-// 恢复最近一次 ps_save 的位置（弹栈；队列重填 + 分层还原 lex/emit 快照）
+// 恢复最近一次 ps_save 的位置（弹栈；环形槽值原样写回 + 分层还原 lex/emit 快照）
 func ps_restore() {
-    var si = len(ps_ss_n) - 1
-    var s = ps_ss_n[si]
-    table_pop(ps_ss_n)
-    var i: i64 = 0
-    var n1 = s[i]
-    i = i + 1
-    var n2 = s[i]
-    i = i + 1
-    var n3 = s[i]
-    i = i + 1
-    var n4 = s[i]
-    i = i + 1
-    var n5 = s[i]
-    i = i + 1
-    var n6 = s[i]
-    i = i + 1
-    while len(pq_tag) > 0 {
-        table_pop(pq_tag)
+    var nn = len(ps_ss)
+    if nn < PS_SNAP_W {
+        return
     }
-    while len(pq_line) > 0 {
-        table_pop(pq_line)
-    }
-    while len(pq_col) > 0 {
-        table_pop(pq_col)
-    }
-    while len(pq_off) > 0 {
-        table_pop(pq_off)
-    }
-    while len(pq_len) > 0 {
-        table_pop(pq_len)
-    }
-    while len(pq_id) > 0 {
-        table_pop(pq_id)
-    }
-    var j: i64 = 0
-    while j < n1 {
-        table_push(pq_tag, s[i])
+    var base = nn - PS_SNAP_W
+    var i = base
+    pq_head = ps_ss[i]
+    i = i + 1
+    pq_n = ps_ss[i]
+    i = i + 1
+    var dv = ps_ss[i]
+    i = i + 1
+    ps_gt_pend = ps_ss[i]
+    i = i + 1
+    ps_ll = ps_ss[i]
+    i = i + 1
+    var s: i64 = 0
+    while s < PQ_CAP {
+        pq_tag[s] = ps_ss[i]
         i = i + 1
-        j = j + 1
-    }
-    j = 0
-    while j < n2 {
-        table_push(pq_line, s[i])
+        pq_line[s] = ps_ss[i]
         i = i + 1
-        j = j + 1
-    }
-    j = 0
-    while j < n3 {
-        table_push(pq_col, s[i])
+        pq_col[s] = ps_ss[i]
         i = i + 1
-        j = j + 1
-    }
-    j = 0
-    while j < n4 {
-        table_push(pq_off, s[i])
+        pq_off[s] = ps_ss[i]
         i = i + 1
-        j = j + 1
-    }
-    j = 0
-    while j < n5 {
-        table_push(pq_len, s[i])
+        pq_len[s] = ps_ss[i]
         i = i + 1
-        j = j + 1
-    }
-    j = 0
-    while j < n6 {
-        table_push(pq_id, s[i])
+        pq_id[s] = ps_ss[i]
         i = i + 1
-        j = j + 1
+        s = s + 1
     }
-    var dv = s[i]
-    i = i + 1
     if dv == 1 {
         ps_dead = true
     } else {
         ps_dead = false
     }
-    ps_gt_pend = s[i]
-    i = i + 1
-    ps_ll = s[i]
-    i = i + 1
+    table_trunc(ps_ss, base)
     em_err_restore()
     lx_restore()
 }
@@ -462,7 +419,7 @@ func ps_type_name() -> i64 {
     // 类型词（共用「类型 'x'」描述）或用户类型名
     var k = ps_kind(0)
     if ps_is_typeword(k) {
-        var nm = ps_text(0)        // 类型词文本须在消费前取（adv 后队列已前移）
+        var nm = lx_kw_text(k)     // 关键字规范文本（免子串分配；adv 前后等价）
         ps_adv()
         return em_nameid(nm)
     }
@@ -478,7 +435,7 @@ func ps_type_name() -> i64 {
 func ps_type() -> i64 {
     var k = ps_kind(0)
     // fn(...) -> R
-    if k == K_IDENT && ps_text(0) == "fn" && ps_kind(1) == K_LPAREN {
+    if k == K_IDENT && ps_span_eq(0, "fn") && ps_kind(1) == K_LPAREN {
         ps_adv()
         ps_adv()
         var n = em_new(T_T_FN)
@@ -2642,9 +2599,7 @@ pub func ps_parse(src: string) -> i64 {
     ps_dead = false
     ps_gt_pend = 0
     ps_ll = 0
-    while len(ps_ss_n) > 0 {
-        table_pop(ps_ss_n)
-    }
+    table_trunc(ps_ss, 0)
     pq_clear()
     var body = ps_strip_header(src)
     lx_start(body)
