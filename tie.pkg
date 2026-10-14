@@ -1,0 +1,16 @@
+// tie.pkg
+// tiel —— tie 轻量解释器（前端）：类 Lua 的可嵌入脚本前端
+// 嵌入方式：
+//   ① tie 软件（源码级）：import "<path>/tiel/tiel.tie"；面=tiel_check(src)
+//   ② 宿主软件（动态库）：tiec --shared embed.tie -o tiel.dll；面=tiel$check / tiel$free_result
+//   ③ 命令行：tiec shell.tie -o tiel.exe → tiel <script.tie>
+[
+    "name": "tiel",
+    "version": "0.1.0",
+    "description": "tie 轻量解释器（前端：词法/语法/错误码；内核在途）",
+    "role": "class",
+    "main": "tiel.tie",
+    "author": "houyangbaoxin2009",
+    "license": "TPL 2.3",
+    "dependencies": [],
+]
